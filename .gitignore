@@ -1,0 +1,28 @@
+# ---- Secrets / environment ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Generated / transient artifacts ----
+sample_data/
+modules/test_audit_workpaper.xlsx
+*.xlsx
+!sample_data/sample_ledger.xlsx
+
+# ---- OS / IDE ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
