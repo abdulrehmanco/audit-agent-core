@@ -114,6 +114,22 @@ def get_groq_api_key() -> str | None:
     key = (os.environ.get("GROQ_API_KEY") or "").strip()
     return None if key in _PLACEHOLDER_KEYS else key
 
+
+def get_tesseract_version() -> str | None:
+    """
+    Return the installed Tesseract version string, or None if it's unavailable.
+
+    Lets the UI / diagnostics confirm at runtime whether scanned-image OCR will
+    work, instead of guessing from build logs.
+    """
+    if pytesseract is None:
+        return None
+    try:
+        return str(pytesseract.get_tesseract_version())
+    except Exception:  # noqa: BLE001 - binary missing or not on PATH
+        return None
+
+
 # Canonical empty result. Returned (or partially filled) whenever extraction
 # cannot produce a value, so downstream code always sees the same shape.
 EMPTY_INVOICE: dict[str, Any] = {

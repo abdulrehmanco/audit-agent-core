@@ -311,6 +311,16 @@ def render_sidebar() -> dict:
         )
 
         st.divider()
+        with st.expander("🩺 System diagnostics"):
+            tess = document_ocr.get_tesseract_version()
+            if tess:
+                st.success(f"Tesseract OCR available (v{tess}) — scans will be read.")
+            else:
+                st.warning(
+                    "Tesseract OCR not detected — scanned/photo invoices can't be "
+                    "read (digital PDFs still work). On Streamlit Cloud, ensure "
+                    "`packages.txt` contains `tesseract-ocr` and reboot the app."
+                )
         st.caption(
             "🔒 **Zero-retention:** uploaded files are processed transiently and "
             "deleted immediately after the run. Nothing is saved to a database."
