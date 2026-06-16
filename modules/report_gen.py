@@ -68,6 +68,7 @@ FILL_MISSING = "FFFCE4D6"         # #FCE4D6 soft red         — MISSING_DOC
 FILL_UNRECORDED = "FFE4DFEC"      # #E4DFEC soft purple      — UNRECORDED_INVOICE
 FILL_PROCESSING = "FFE7E6E6"      # #E7E6E6 soft gray        — PROCESSING_ERROR / NEEDS_REVIEW
 FILL_DUPLICATE = "FFFAC090"       # #FAC090 soft bright orange — POTENTIAL_DUPLICATE_CLAIM
+FILL_DUPLICATE_DOC = "FFDDEBF7"   # #DDEBF7 soft blue (informational) — DUPLICATE_DOCUMENT
 
 # Accounting-style currency format (per spec).
 CURRENCY_FORMAT = r'_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
@@ -95,6 +96,7 @@ STATUS_FILLS: dict[str, str] = {
     "PROCESSING_ERROR": FILL_PROCESSING,
     "NEEDS_REVIEW": FILL_PROCESSING,
     "POTENTIAL_DUPLICATE_CLAIM": FILL_DUPLICATE,
+    "DUPLICATE_DOCUMENT": FILL_DUPLICATE_DOC,
 }
 
 # The mandatory methodology & limitations disclaimer (review item #8).
@@ -281,6 +283,7 @@ def _build_summary(ws: Worksheet, summary: dict, start_row: int) -> int:
         ("Exceptions Flagged", summary.get("exception_count", 0)),
         ("Missing Documents", summary.get("missing_doc_count", 0)),
         ("Potential Duplicate Claims", summary.get("potential_duplicate_count", 0)),
+        ("Duplicate Documents (informational)", summary.get("duplicate_document_count", 0)),
         ("Unrecorded Invoices (completeness)", summary.get("unrecorded_invoice_count", 0)),
         ("Processing Errors (tooling)", summary.get("processing_error_count", 0)),
         ("Tolerance Applied", f"± ${abs_tol:,.2f}  /  {rel_tol_pct:.3g}%"),
@@ -474,6 +477,7 @@ if __name__ == "__main__":
             "exception_count": 1,
             "missing_doc_count": 1,
             "potential_duplicate_count": 1,
+            "duplicate_document_count": 1,
             "unrecorded_invoice_count": 1,
             "processing_error_count": 1,
             "tolerance_absolute": 0.05,
@@ -515,6 +519,11 @@ if __name__ == "__main__":
              "status": "PROCESSING_ERROR", "variance": 0.0,
              "matching_invoice_file": "blurry_scan.pdf",
              "audit_notes": "AI EXTRACTION FAILURE (HTTP 429). Tooling limitation, NOT a missing document."},
+            {"ledger_row_index": None, "ledger_vendor": "Quill LLC",
+             "ledger_amount": 320.00, "ledger_invoice_no": "INV-QL-55820",
+             "status": "DUPLICATE_DOCUMENT", "variance": 0.0,
+             "matching_invoice_file": "Quill_INV-QL-55820_SCAN.png",
+             "audit_notes": "DUPLICATE DOCUMENT (informational): scan copy of an already-recorded invoice."},
         ],
     }
 
@@ -565,6 +574,7 @@ if __name__ == "__main__":
     assert seen_statuses == [
         "VERIFIED", "VERIFIED_WITHIN_TOLERANCE", "EXCEPTION", "MISSING_DOC",
         "POTENTIAL_DUPLICATE_CLAIM", "UNRECORDED_INVOICE", "PROCESSING_ERROR",
+        "DUPLICATE_DOCUMENT",
     ], f"Unexpected status ordering: {seen_statuses}"
 
     # Spot-check the currency format on the first Amount cell.

@@ -88,6 +88,7 @@ STATUS_COLORS = {
     "EXCEPTION": "#FFF2CC",
     "MISSING_DOC": "#FCE4D6",
     "POTENTIAL_DUPLICATE_CLAIM": "#FAC090",
+    "DUPLICATE_DOCUMENT": "#DDEBF7",
     "UNRECORDED_INVOICE": "#E4DFEC",
     "PROCESSING_ERROR": "#E7E6E6",
     "NEEDS_REVIEW": "#E7E6E6",
@@ -115,6 +116,26 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Hide Streamlit's default chrome (top-right toolbar incl. the GitHub "Fork"
+# button and hamburger menu, plus the bottom "Made with Streamlit" badge/footer)
+# for a clean, white-labelled look. We deliberately do NOT hide the whole header
+# so the mobile sidebar-open control still works.
+_HIDE_STREAMLIT_CHROME = """
+    <style>
+      [data-testid="stToolbar"] {display: none !important;}
+      #MainMenu {visibility: hidden !important;}
+      [data-testid="stStatusWidget"] {display: none !important;}
+      [data-testid="stDecoration"] {display: none !important;}
+      footer {visibility: hidden !important; height: 0 !important;}
+      /* "Hosted with / Made with Streamlit" viewer badge (class names vary by
+         version, so match broadly) */
+      [class*="viewerBadge"] {display: none !important;}
+      a[href*="streamlit.io/cloud"],
+      a[href*="share.streamlit.io"] {display: none !important;}
+    </style>
+"""
+st.markdown(_HIDE_STREAMLIT_CHROME, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -428,9 +449,22 @@ def render_dashboard(reconciliation: dict, report_bytes: bytes) -> None:
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     r2c1.metric("❌ Missing Docs", summary.get("missing_doc_count", 0))
-    r2c2.metric("🟠 Duplicate Claims", summary.get("potential_duplicate_count", 0))
+    r2c2.metric(
+        "🟠 Duplicate Claims",
+        summary.get("potential_duplicate_count", 0),
+        help="Same invoice booked on multiple ledger lines — a payment risk.",
+    )
     r2c3.metric("🟣 Unrecorded Invoices", summary.get("unrecorded_invoice_count", 0))
     r2c4.metric("⚙️ Processing Errors", summary.get("processing_error_count", 0))
+
+    # Document copies (e.g. a scan of an already-booked invoice) are informational
+    # only — shown separately so they don't inflate the payment-risk count.
+    dup_docs = summary.get("duplicate_document_count", 0)
+    if dup_docs:
+        st.caption(
+            f"🔵 {dup_docs} duplicate document(s) detected (e.g. a scan of an "
+            "already-recorded invoice) — informational only, not a payment risk."
+        )
 
     # Surface the tolerance applied so the on-screen view is self-documenting.
     abs_tol = summary.get("tolerance_absolute", 0.0)

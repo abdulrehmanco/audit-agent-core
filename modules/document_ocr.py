@@ -154,8 +154,14 @@ SYSTEM_PROMPT: str = (
     "vendor invoice. Your sole job is to extract exactly four fields and return "
     "them as a strict, minified JSON object.\n\n"
     "Fields to extract:\n"
-    '  - "vendor_name": the name of the company that ISSUED the invoice '
-    "(the supplier/seller), as a string.\n"
+    '  - "vendor_name": the name of the company that ISSUED / SOLD / SENT the '
+    "invoice — the supplier/seller, normally shown in the letterhead at the very "
+    "top of the document or after labels like 'From', 'Seller', 'Supplier', "
+    "'Remit To', or 'Vendor'.\n"
+    "       CRITICAL: this is NOT the customer/recipient. Do NOT use the company "
+    "found under 'Bill To', 'Sold To', 'Ship To', 'Invoice To', 'Customer', or "
+    "'Buyer' — that is the buyer, not the vendor. If the seller and a Bill-To "
+    "company both appear, always choose the seller (issuer).\n"
     '  - "invoice_number": the invoice identifier/reference, as a string '
     "(preserve any letters, dashes, and leading zeros).\n"
     '  - "date": the invoice date as a string, exactly as written on the '
@@ -169,7 +175,9 @@ SYSTEM_PROMPT: str = (
     "  2. If a field cannot be found or is ambiguous, set its value to null.\n"
     "  3. The JSON keys must be exactly: vendor_name, invoice_number, date, "
     "total_amount.\n"
-    "  4. total_amount must be a JSON number or null — never a quoted string.\n\n"
+    "  4. total_amount must be a JSON number or null — never a quoted string.\n"
+    "  5. Extract ONLY from the document text provided below — never invent or "
+    "reuse a company name that does not appear in this document.\n\n"
     "Output schema (shape only):\n"
     '{"vendor_name": "string or null", "invoice_number": "string or null", '
     '"date": "string or null", "total_amount": 0.0}'
@@ -346,14 +354,18 @@ def _coerce_invoice_schema(payload: dict[str, Any]) -> dict[str, Any]:
         result[key] = text or None
 
     # total_amount -> float | None, tolerating "$1,234.50"-style strings.
+    # Always quantize to cents so a clean amount is never carried with binary
+    # float noise (e.g. 921.0700000000001) into the downstream comparison.
     amount = payload.get("total_amount")
     if amount is not None:
         if isinstance(amount, (int, float)):
-            result["total_amount"] = float(amount)
+            result["total_amount"] = round(float(amount), 2)
         else:
             cleaned = "".join(ch for ch in str(amount) if ch.isdigit() or ch in ".-")
             try:
-                result["total_amount"] = float(cleaned) if cleaned not in ("", ".", "-") else None
+                result["total_amount"] = (
+                    round(float(cleaned), 2) if cleaned not in ("", ".", "-") else None
+                )
             except ValueError:
                 logger.warning("Could not coerce total_amount %r to float.", amount)
                 result["total_amount"] = None

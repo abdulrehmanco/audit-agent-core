@@ -218,14 +218,16 @@ def _clean_amount(value: Any) -> float | None:
         value: The raw amount cell.
 
     Returns:
-        A float, or None if the value is empty/non-numeric.
+        A float rounded to cents, or None if the value is empty/non-numeric.
+        Rounding here guarantees amounts never carry binary float noise (e.g.
+        921.0700000000001) into the downstream deterministic comparison.
     """
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
 
     # Fast path: already numeric.
     if isinstance(value, (int, float)):
-        return float(value)
+        return round(float(value), 2)
 
     text = str(value).strip()
     if text in ("", "-", "—", "n/a", "na", "none"):
@@ -253,7 +255,8 @@ def _clean_amount(value: Any) -> float | None:
     except ValueError:
         return None
 
-    return -abs(amount) if negative else amount
+    amount = -abs(amount) if negative else amount
+    return round(amount, 2)
 
 
 def _clean_reference(value: Any) -> str:

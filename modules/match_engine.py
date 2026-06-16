@@ -112,7 +112,8 @@ STATUS_VERIFIED = "VERIFIED"
 STATUS_VERIFIED_TOL = "VERIFIED_WITHIN_TOLERANCE"
 STATUS_EXCEPTION = "EXCEPTION"
 STATUS_MISSING = "MISSING_DOC"
-STATUS_DUPLICATE = "POTENTIAL_DUPLICATE_CLAIM"
+STATUS_DUPLICATE = "POTENTIAL_DUPLICATE_CLAIM"   # same invoice on >1 LEDGER line (payment risk)
+STATUS_DUPLICATE_DOCUMENT = "DUPLICATE_DOCUMENT"  # same invoice as >1 FILE, one ledger line (informational)
 STATUS_UNRECORDED = "UNRECORDED_INVOICE"
 STATUS_PROCESSING_ERROR = "PROCESSING_ERROR"
 
@@ -125,10 +126,10 @@ VENDOR_MATCH_THRESHOLD: int = 88          # vendor similarity for a clean vendor
 # invoice number does NOT match. Kept high to avoid false matches like
 # "LinkedIn" vs "Uline" (~75%) stealing an unrelated invoice.
 VENDOR_CANDIDATE_THRESHOLD: int = 85
-# When the invoice NUMBER matches exactly, the document is already identified, so
-# the vendor name only needs to be *plausibly* the same entity (catches
-# "Dell Corp" vs "Dell Inc.", "Amazon Web Svcs" vs "Amazon Web Services, Inc.").
-VENDOR_CORROBORATION_THRESHOLD: int = 70
+# NOTE: when the invoice NUMBER matches exactly AND the amount agrees, the verdict
+# is VERIFIED regardless of vendor-name similarity (key precedence) — the vendor
+# score never vetoes that, it's only recorded as an informational note. An
+# acronym like "HP Inc" vs "Hewlett-Packard" (~29%) is plainly the same vendor.
 MONEY_PRECISION: int = 2                  # money compared to the penny
 
 # Default reconciliation tolerances (callers/UI may override per run).
@@ -360,12 +361,12 @@ def _evaluate_matched_line(
     """
     Render the deterministic verdict for a ledger line with a matched candidate.
 
-    The invoice NUMBER is treated as the primary key. When it matches exactly,
-    the document is positively identified, so the vendor name only needs to be
-    *plausibly* the same entity (corroboration threshold) — this lets fuzzy
-    vendor spellings like "Dell Corp" vs "Dell Inc." verify when the invoice
-    number and amount both tie out. When the match was made on vendor similarity
-    alone (no invoice-number match), the stricter vendor threshold applies.
+    The invoice NUMBER is treated as the primary key (KEY PRECEDENCE): when it
+    matches exactly AND the amount agrees, the verdict is VERIFIED regardless of
+    the vendor-name score — the vendor never vetoes it (so "HP Inc" vs
+    "Hewlett-Packard" verifies), with any vendor difference recorded as a note.
+    When the match was made on vendor similarity alone (no invoice-number match),
+    the stricter vendor threshold applies.
 
     Produces VERIFIED, VERIFIED_WITHIN_TOLERANCE, or EXCEPTION.
     """
@@ -377,7 +378,6 @@ def _evaluate_matched_line(
     invoice_no_match = detail["invoice_no_match"]
     vendor_score = detail["vendor_score"]
     vendor_ok = vendor_score >= VENDOR_MATCH_THRESHOLD
-    vendor_plausible = vendor_score >= VENDOR_CORROBORATION_THRESHOLD
 
     led_vendor = result["ledger_vendor"]
     doc_vendor = invoice.get("vendor_name")
@@ -402,40 +402,50 @@ def _evaluate_matched_line(
         # Invoice number identifies the document. Require only that the vendor is
         # plausibly the same entity; flag a markedly different vendor (which would
         # suggest a reused invoice number or a misposting).
-        if not vendor_plausible:
-            reasons.append(
-                f"invoice number matches but the vendor is markedly different "
-                f"(similarity {vendor_score}%; ledger '{led_vendor}' vs document "
-                f"'{doc_vendor}') — possible misposting or reused invoice number"
+        #
+        # KEY PRECEDENCE: an exact invoice number + an agreeing amount is decisive
+        # evidence on its own, so the vendor-name score NEVER vetoes a verify here
+        # (an acronym like "HP Inc" vs "Hewlett-Packard" scores ~29% but is plainly
+        # the same vendor). A vendor that isn't a clean match is recorded as an
+        # informational note, not an exception.
+        vendor_note = (
+            ""
+            if vendor_ok
+            else (
+                f" Note: vendor name differs (ledger '{led_vendor}' vs document "
+                f"'{doc_vendor}', similarity {vendor_score}%); verified on the exact "
+                "invoice number and amount."
             )
-        elif amount_exact:
+        )
+        if amount_exact:
             result["status"] = STATUS_VERIFIED
-            vmsg = (
-                "vendor matches exactly"
-                if vendor_ok
-                else f"vendor matches via fuzzy/abbreviation (similarity {vendor_score}%)"
-            )
             result["audit_notes"] = (
-                f"VERIFIED: invoice number matches exactly, {vmsg}, and the amount "
-                f"ties out to the penny (variance {variance:.2f})."
+                "VERIFIED: invoice number matches exactly and the amount ties out "
+                f"to the penny (variance {variance:.2f})." + vendor_note
             )
             return result
         elif amount_within_tol:
             result["status"] = STATUS_VERIFIED_TOL
             result["audit_notes"] = (
-                "VERIFIED WITHIN TOLERANCE: invoice number matches and vendor is "
-                f"consistent (similarity {vendor_score}%); amount variance of "
-                f"{variance:.2f} is within the allowed tolerance of ±{allowed:.2f} "
+                "VERIFIED WITHIN TOLERANCE: invoice number matches; amount variance "
+                f"of {variance:.2f} is within the allowed tolerance of ±{allowed:.2f} "
                 f"(abs ${abs_tol:.2f} / rel {rel_tol * 100:.3g}%). Likely rounding, "
-                "tax, or FX. Logged for auditor awareness."
+                "tax, or FX. Logged for auditor awareness." + vendor_note
             )
             return result
         else:
+            # Invoice number matches but the amount is genuinely off — a real
+            # discrepancy. Note any vendor difference too, but the amount drives it.
             reasons.append(
                 f"amount variance of {variance:.2f} exceeds the allowed tolerance "
                 f"of ±{allowed:.2f} (ledger {led_amount:.2f} vs invoice "
                 f"{inv_amount:.2f})"
             )
+            if not vendor_ok:
+                reasons.append(
+                    f"vendor name also differs (ledger '{led_vendor}' vs document "
+                    f"'{doc_vendor}', similarity {vendor_score}%)"
+                )
     else:
         # Matched on vendor similarity only — no invoice-number corroboration, so
         # apply the strict vendor threshold and flag any invoice-number conflict.
@@ -489,12 +499,13 @@ def _evaluate_matched_line(
 
 def _duplicate_document_result(invoice: dict) -> dict:
     """
-    Build a POTENTIAL_DUPLICATE_CLAIM row for an unmatched invoice whose number
-    is the SAME as an invoice already matched to the ledger.
+    Build a DUPLICATE_DOCUMENT row for an unmatched invoice file whose number is
+    the SAME as an invoice already matched to a (single) ledger line.
 
     This is a duplicate *document* (e.g. a re-scanned copy of an invoice that was
-    already recorded), not an unrecorded liability — so it must not be reported
-    as a completeness risk.
+    already recorded against one ledger line) — NOT a duplicate payment claim and
+    NOT an unrecorded liability. It is informational and is excluded from the
+    "potential duplicate claims" tally.
     """
     inv_amount = _to_money(invoice.get("total_amount"))
     return {
@@ -502,15 +513,15 @@ def _duplicate_document_result(invoice: dict) -> dict:
         "ledger_vendor": str(invoice.get("vendor_name") or ""),
         "ledger_amount": inv_amount if inv_amount is not None else 0.0,
         "ledger_invoice_no": str(invoice.get("invoice_number") or ""),
-        "status": STATUS_DUPLICATE,
+        "status": STATUS_DUPLICATE_DOCUMENT,
         "variance": 0.0,
         "matching_invoice_file": _invoice_file_ref(invoice),
         "audit_notes": (
-            "POTENTIAL DUPLICATE CLAIM: this invoice document carries the same "
+            "DUPLICATE DOCUMENT (informational): this invoice file carries the same "
             f"invoice number ('{invoice.get('invoice_number')}') as an invoice "
-            "already matched to the ledger — it appears to be a duplicate copy of "
-            "a recorded invoice, not an unrecorded liability. Verify it is not a "
-            "second payment."
+            "already matched to a ledger line — it appears to be a redundant copy "
+            "(e.g. a scan of an already-booked PDF), not an unrecorded liability "
+            "and not a duplicate payment. No ledger impact; provided for awareness."
         ),
     }
 
@@ -687,6 +698,7 @@ def reconcile_ledger_with_invoices(
         STATUS_EXCEPTION: 0,
         STATUS_MISSING: 0,
         STATUS_DUPLICATE: 0,
+        STATUS_DUPLICATE_DOCUMENT: 0,
         STATUS_UNRECORDED: 0,
         STATUS_PROCESSING_ERROR: 0,
     }
@@ -700,7 +712,11 @@ def reconcile_ledger_with_invoices(
         "verified_within_tolerance_count": counts[STATUS_VERIFIED_TOL],
         "exception_count": counts[STATUS_EXCEPTION],
         "missing_doc_count": counts[STATUS_MISSING],
+        # Payment risk: same invoice on multiple LEDGER lines. Document copies
+        # (same invoice as multiple FILES, one ledger line) are tracked separately
+        # and intentionally NOT included here.
         "potential_duplicate_count": counts[STATUS_DUPLICATE],
+        "duplicate_document_count": counts[STATUS_DUPLICATE_DOCUMENT],
         "unrecorded_invoice_count": counts[STATUS_UNRECORDED],
         "processing_error_count": counts[STATUS_PROCESSING_ERROR],
         "tolerance_absolute": round(absolute_tolerance, MONEY_PRECISION),
@@ -711,12 +727,13 @@ def reconcile_ledger_with_invoices(
 
     logger.info(
         "Reconciliation complete: %d ledger lines | verified=%d, within_tol=%d, "
-        "exceptions=%d, missing=%d, duplicates=%d, unrecorded=%d, errors=%d.",
+        "exceptions=%d, missing=%d, dup_claims=%d, dup_docs=%d, unrecorded=%d, "
+        "errors=%d.",
         ledger_result_count,
         counts[STATUS_VERIFIED], counts[STATUS_VERIFIED_TOL],
         counts[STATUS_EXCEPTION], counts[STATUS_MISSING],
-        counts[STATUS_DUPLICATE], counts[STATUS_UNRECORDED],
-        counts[STATUS_PROCESSING_ERROR],
+        counts[STATUS_DUPLICATE], counts[STATUS_DUPLICATE_DOCUMENT],
+        counts[STATUS_UNRECORDED], counts[STATUS_PROCESSING_ERROR],
     )
     return payload
 
@@ -764,6 +781,11 @@ if __name__ == "__main__":
         #     VERIFIED_WITHIN_TOLERANCE (regression for float rounding).
         {"ledger_row_index": 11, "ledger_vendor": "Comcast Business",
          "ledger_amount": 1240.6600000000001, "ledger_invoice_no": "INV-CMB-1"},
+        # 11) Acronym vendor that will NEVER clear string similarity ("HP Inc" vs
+        #     "Hewlett-Packard", ~29%) but has an exact invoice no. + amount ->
+        #     KEY PRECEDENCE must return VERIFIED, not EXCEPTION.
+        {"ledger_row_index": 12, "ledger_vendor": "HP Inc",
+         "ledger_amount": 33450.00, "ledger_invoice_no": "INV-HP-90120"},
     ]
 
     mock_invoices = [
@@ -791,6 +813,10 @@ if __name__ == "__main__":
         # Penny-exact partner for the float-rounding row (row 11).
         {"vendor_name": "Comcast Business", "invoice_number": "INV-CMB-1",
          "total_amount": 1240.66, "source_file": "comcast_1.pdf"},
+        # Acronym partner for the key-precedence row (row 12) — vendor name is
+        # totally different as a string but invoice no. + amount tie out exactly.
+        {"vendor_name": "Hewlett-Packard", "invoice_number": "INV-HP-90120",
+         "total_amount": 33450.00, "source_file": "hp_90120.pdf"},
         # Flagged by OCR as unreadable -> PROCESSING_ERROR (NOT missing doc)
         {"vendor_name": None, "invoice_number": None, "total_amount": None,
          "source_file": "blurry_scan.pdf",
@@ -803,13 +829,15 @@ if __name__ == "__main__":
     print(json.dumps(report, indent=2))
 
     s = report["summary"]
-    assert s["total_ledger_records"] == 10
-    assert s["verified_count"] == 4, "Acme, Dell(fuzzy), Uline, Comcast(penny-exact)"
+    assert s["total_ledger_records"] == 11
+    assert s["verified_count"] == 5, "Acme, Dell, Uline, Comcast, HP(acronym)"
     assert s["verified_within_tolerance_count"] == 1, "one VERIFIED_WITHIN_TOLERANCE"
     assert s["exception_count"] == 1, "one EXCEPTION"
     assert s["missing_doc_count"] == 2, "Initech + LinkedIn (no false match)"
-    # Two ledger duplicate claims + one duplicate document = 3
-    assert s["potential_duplicate_count"] == 3, "two ledger dups + one dup document"
+    # Payment-risk duplicate claims = the two INV-777 ledger postings ONLY.
+    assert s["potential_duplicate_count"] == 2, "two ledger duplicate claims"
+    # Document copy (scan of a recorded invoice) is separate and uncounted above.
+    assert s["duplicate_document_count"] == 1, "one duplicate DOCUMENT (scan copy)"
     assert s["unrecorded_invoice_count"] == 1, "one UNRECORDED_INVOICE"
     assert s["processing_error_count"] == 1, "one PROCESSING_ERROR"
 
@@ -830,12 +858,15 @@ if __name__ == "__main__":
     assert by_row[10]["status"] == "VERIFIED", "victim invoice line must stay verified"
     # Bug #4 regression: penny-exact from float noise is VERIFIED, not within-tol.
     assert by_row[11]["status"] == "VERIFIED" and by_row[11]["variance"] == 0.0
+    # Key precedence: acronym vendor (~29%) verifies on exact invoice# + amount.
+    assert by_row[12]["status"] == "VERIFIED", "key precedence must verify HP acronym"
+    assert "vendor name differs" in by_row[12]["audit_notes"], "must log vendor note"
 
-    # The duplicate scanned copy is a duplicate DOCUMENT, not unrecorded.
-    dup_docs = [r for r in report["results"]
-                if r["status"] == "POTENTIAL_DUPLICATE_CLAIM"
-                and r["ledger_row_index"] is None]
+    # The scanned copy is a DUPLICATE_DOCUMENT (informational), NOT a payment
+    # claim and NOT unrecorded.
+    dup_docs = [r for r in report["results"] if r["status"] == "DUPLICATE_DOCUMENT"]
     assert dup_docs and "beta_777_SCAN.png" in (dup_docs[0]["matching_invoice_file"] or "")
+    assert by_row.get(0) is None  # document rows carry no ledger row index
 
     # The errored invoice lives in its own PROCESSING_ERROR bucket.
     err_rows = [r for r in report["results"] if r["status"] == "PROCESSING_ERROR"]
