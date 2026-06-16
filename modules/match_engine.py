@@ -161,10 +161,34 @@ _ERROR_FLAG_KEYS = ("processing_error", "extraction_error", "error", "failed")
 # Normalization helpers
 # ---------------------------------------------------------------------------
 def _norm_invoice_no(value: Any) -> str:
-    """Normalize an invoice number for strict equality (e.g. 'INV-001'->'INV001')."""
+    """
+    Normalize an invoice number to a comparison key, tolerant of OCR/export noise.
+
+    Crucially, a leading "INV"/"INVOICE" label (with optional "No."/"#" and any
+    separators) is stripped, because scanners and exports inconsistently drop or
+    mangle it. This makes a corrupted scan key still match its clean twin:
+
+        "INV-WBM-44120"      -> "WBM44120"
+        "WBM-44120"          -> "WBM44120"   (prefix dropped by OCR — still matches)
+        "Invoice No: 2026-7" -> "20267"
+        "INV-001"            -> "001"
+
+    The leading label is only stripped when followed by a separator/whitespace, so
+    a genuine token like "INVERTER-5" is left intact.
+    """
     if value is None:
         return ""
-    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+    text = str(value).upper().strip()
+    # Drop a leading invoice-label prefix (INV / INVOICE [NO|NUM|#]) + separator(s).
+    text = re.sub(
+        r"^\s*INV(?:OICE)?(?:\s*(?:NO\.?|NUM(?:BER)?|#))?[-:.#/\s]+",
+        "",
+        text,
+    )
+    core = re.sub(r"[^A-Z0-9]", "", text)
+    # Guard: if stripping the prefix emptied the key (e.g. the value was just
+    # "INV-"), fall back to the raw alphanumerics so we don't collapse to "".
+    return core or re.sub(r"[^A-Z0-9]", "", str(value).upper())
 
 
 def _norm_vendor(value: Any) -> str:
@@ -836,6 +860,10 @@ if __name__ == "__main__":
         {"ledger_row_index": 15, "ledger_vendor": "Staples",
          "ledger_amount": 300.00, "ledger_invoice_no": "INV-STGL-1",
          "gl_account": "6000 IT Equipment"},
+        # 15) WB Mason booked once; matched by its clean PDF. A SECOND scanned file
+        #     of the same invoice exists but OCR dropped the "INV-" prefix — Gap 1.
+        {"ledger_row_index": 16, "ledger_vendor": "WB Mason",
+         "ledger_amount": 534.90, "ledger_invoice_no": "INV-WBM-44120"},
     ]
 
     mock_invoices = [
@@ -877,6 +905,14 @@ if __name__ == "__main__":
         {"vendor_name": "Staples", "invoice_number": "INV-STGL-1",
          "total_amount": 300.00, "source_file": "staples_gl.pdf",
          "line_items": "Copy paper cases, toner cartridges, pens"},
+        # Clean PDF of WB Mason's invoice — matches ledger row 16.
+        {"vendor_name": "WB Mason", "invoice_number": "INV-WBM-44120",
+         "total_amount": 534.90, "source_file": "WBMason_INV-WBM-44120.pdf"},
+        # SCANNED copy of the SAME invoice: OCR dropped the "INV-" prefix and the
+        # vendor came out as the bill-to. With prefix-tolerant normalization this
+        # must still dedupe -> DUPLICATE_DOCUMENT, NOT a phantom UNRECORDED.
+        {"vendor_name": "Tindle & Vance Trading Co.", "invoice_number": "WBM-44120",
+         "total_amount": 534.90, "source_file": "WBMason_INV-WBM-44120_SCAN.png"},
         # Flagged by OCR as unreadable -> PROCESSING_ERROR (NOT missing doc)
         {"vendor_name": None, "invoice_number": None, "total_amount": None,
          "source_file": "blurry_scan.pdf",
@@ -889,15 +925,15 @@ if __name__ == "__main__":
     print(json.dumps(report, indent=2))
 
     s = report["summary"]
-    assert s["total_ledger_records"] == 14
-    assert s["verified_count"] == 8, "incl. HP, Costco, AWS-GL, Staples-GL"
+    assert s["total_ledger_records"] == 15
+    assert s["verified_count"] == 9, "incl. HP, Costco, AWS-GL, Staples-GL, WB Mason"
     assert s["verified_within_tolerance_count"] == 1, "one VERIFIED_WITHIN_TOLERANCE"
     assert s["exception_count"] == 1, "one EXCEPTION"
     assert s["missing_doc_count"] == 2, "Initech + LinkedIn (no false match)"
     # Payment-risk duplicate claims = the two INV-777 ledger postings ONLY.
     assert s["potential_duplicate_count"] == 2, "two ledger duplicate claims"
-    # Document copy (scan of a recorded invoice) is separate and uncounted above.
-    assert s["duplicate_document_count"] == 1, "one duplicate DOCUMENT (scan copy)"
+    # Two document copies: Beta scan + WB Mason prefix-corrupted scan (Gap 1).
+    assert s["duplicate_document_count"] == 2, "Beta + WB Mason scan copies"
     assert s["unrecorded_invoice_count"] == 1, "one UNRECORDED_INVOICE"
     assert s["processing_error_count"] == 1, "one PROCESSING_ERROR"
 
@@ -937,11 +973,25 @@ if __name__ == "__main__":
     # Summary GL tally present.
     assert s["gl_consistent_count"] >= 1 and s["gl_possible_mismatch_count"] >= 1
 
-    # The scanned copy is a DUPLICATE_DOCUMENT (informational), NOT a payment
-    # claim and NOT unrecorded.
-    dup_docs = [r for r in report["results"] if r["status"] == "DUPLICATE_DOCUMENT"]
-    assert dup_docs and "beta_777_SCAN.png" in (dup_docs[0]["matching_invoice_file"] or "")
-    assert by_row.get(0) is None  # document rows carry no ledger row index
+    # The scanned copies are DUPLICATE_DOCUMENT (informational), NOT payment
+    # claims and NOT unrecorded.
+    dup_files = {
+        r["matching_invoice_file"]
+        for r in report["results"] if r["status"] == "DUPLICATE_DOCUMENT"
+    }
+    assert any("beta_777_SCAN.png" in (f or "") for f in dup_files)
+    # GAP 1: the WB Mason scan with the dropped "INV-" prefix must dedupe to a
+    # DUPLICATE_DOCUMENT, NOT a phantom UNRECORDED_INVOICE.
+    assert any("WBMason_INV-WBM-44120_SCAN.png" in (f or "") for f in dup_files), (
+        "prefix-corrupted scan must still dedupe to DUPLICATE_DOCUMENT"
+    )
+    # WB Mason's real ledger line was matched (not affected by the corrupt scan).
+    assert by_row[16]["status"] == "VERIFIED"
+
+    # GAP 1 unit check: prefix-tolerant invoice-number normalization.
+    assert _norm_invoice_no("WBM-44120") == _norm_invoice_no("INV-WBM-44120")
+    assert _norm_invoice_no("Invoice No: 2026-7") == _norm_invoice_no("INV-2026-7")
+    assert _norm_invoice_no("INVERTER-5") == "INVERTER5", "must not strip non-label INV"
 
     # The errored invoice lives in its own PROCESSING_ERROR bucket.
     err_rows = [r for r in report["results"] if r["status"] == "PROCESSING_ERROR"]

@@ -164,8 +164,14 @@ SYSTEM_PROMPT: str = (
     "found under 'Bill To', 'Sold To', 'Ship To', 'Invoice To', 'Customer', or "
     "'Buyer' — that is the buyer, not the vendor. If the seller and a Bill-To "
     "company both appear, always choose the seller (issuer).\n"
-    '  - "invoice_number": the invoice identifier/reference, as a string '
-    "(preserve any letters, dashes, and leading zeros).\n"
+    "       On SCANNED/OCR text the layout may be jumbled and the Bill-To name "
+    "may appear first or near the top — do not be fooled by position. The seller "
+    "is the entity issuing the charge; the company immediately after a 'Bill To'/"
+    "'Sold To'/'Ship To' label is ALWAYS the buyer and must go in bill_to_name.\n"
+    '  - "invoice_number": the invoice identifier/reference, as a string. '
+    "Copy it EXACTLY and COMPLETELY, including any leading 'INV-' / 'INV ' prefix "
+    "and all letters, dashes, and leading zeros — never drop or shorten the "
+    "prefix.\n"
     '  - "date": the invoice date as a string, exactly as written on the '
     "document.\n"
     '  - "total_amount": the final total amount due as a number (float). '

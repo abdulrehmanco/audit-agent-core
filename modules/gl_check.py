@@ -61,12 +61,18 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "courier", "parcel", "delivery", "express", "pallet",
     ],
     "Office Supplies": [
-        "paper", "pens", "toner", "ink", "breakroom", "stapler", "notebook",
-        "binder", "cartridge", "envelope", "office supplies",
+        "paper", "copy paper", "pens", "pen", "pencil", "toner", "ink",
+        "cartridge", "stapler", "staples", "notebook", "binder", "binders",
+        "folder", "folders", "file folder", "sticky note", "sticky notes",
+        "post-it", "envelope", "envelopes", "labels", "tape", "office supplies",
+        # "breakroom" intentionally kept as a single WEAK signal — it overlaps
+        # with Facilities, so on mixed Costco-style rows it stays ambiguous.
+        "breakroom",
     ],
     "Maintenance Supplies": [
         "maintenance", "repair", "lubricant", "fastener", "bolt", "filter",
         "hvac", "janitorial", "cleaning", "grease", "valve",
+        "uniform", "mat service", "floor mat", "uniform rental",
     ],
     "Software Subscriptions": [
         "subscription", "annual plan", "seats", "users", "license", "saas",
@@ -102,13 +108,16 @@ VENDOR_CATEGORY: dict[str, str] = {
     "fedex": "Shipping & Freight", "ups": "Shipping & Freight",
     "dhl": "Shipping & Freight",
     "staples": "Office Supplies", "office depot": "Office Supplies",
-    "quill": "Office Supplies",
+    "quill": "Office Supplies", "wb mason": "Office Supplies",
+    "w.b. mason": "Office Supplies", "w b mason": "Office Supplies",
     "grainger": "Maintenance Supplies", "fastenal": "Maintenance Supplies",
+    "unifirst": "Maintenance Supplies", "cintas": "Maintenance Supplies",
     "uline": "Shipping & Freight",
     "adobe": "Software Subscriptions", "docusign": "Software Subscriptions",
     "slack": "Software Subscriptions", "microsoft": "Software Subscriptions",
     "zoom": "Software Subscriptions",
-    "wework": "Rent & Facilities",
+    "wework": "Rent & Facilities", "industrious": "Rent & Facilities",
+    "regus": "Rent & Facilities",
     "comcast": "Utilities & Telecom", "verizon": "Utilities & Telecom",
     "at&t": "Utilities & Telecom",
     "iron mountain": "Records & Storage",
@@ -159,9 +168,15 @@ def infer_category(
     scores: dict[str, int] = {}
     matched: dict[str, list[str]] = {}
 
-    # Content keyword signals.
+    # Content keyword signals. Collapse substring overlaps so synonyms for the
+    # same concept count once (e.g. "paper" inside "copy paper" is not double
+    # counted) — otherwise a single item could inflate a category to "strong".
     for cat, kws in CATEGORY_KEYWORDS.items():
         hits = [kw for kw in kws if kw in text_l]
+        hits = [
+            kw for kw in hits
+            if not any(kw != other and kw in other for other in hits)
+        ]
         if hits:
             scores[cat] = scores.get(cat, 0) + len(hits)
             matched.setdefault(cat, []).extend(hits)
@@ -176,9 +191,25 @@ def infer_category(
     if not scores:
         return None, "none", []
 
-    best = max(scores, key=lambda c: scores[c])
-    best_score = scores[best]
-    confidence = "strong" if best_score >= 2 else "weak"
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+    # Confidence:
+    #   ambiguous — a competing category sits within 1 point of the winner
+    #               (genuinely mixed content, e.g. a Costco-style basket): the
+    #               caller treats this as UNDETERMINED so mixed rows never get a
+    #               confident verdict.
+    #   strong    — a clear winner (>=2 signals) with a >1 margin over the rest.
+    #   weak      — a single lone signal, no competition.
+    if second_score >= 1 and (best_score - second_score) <= 1:
+        confidence = "ambiguous"
+    elif best_score >= 2:
+        confidence = "strong"
+    elif best_score >= 1:
+        confidence = "weak"
+    else:  # pragma: no cover - scores is non-empty here
+        confidence = "ambiguous"
     return best, confidence, matched.get(best, [])
 
 
@@ -230,11 +261,14 @@ def check_gl_account(
         )
 
     inferred, confidence, signals = infer_category(vendor_name, line_items)
-    if inferred is None:
-        return _result(
-            GL_UNDETERMINED, canonical_booked, "",
-            "Insufficient invoice content to infer an expense category.",
+    if inferred is None or confidence == "ambiguous":
+        reason = (
+            "Insufficient invoice content to infer an expense category."
+            if inferred is None
+            else "Invoice content spans multiple categories (mixed/ambiguous); "
+            "not flagging a mismatch."
         )
+        return _result(GL_UNDETERMINED, canonical_booked, "", reason)
 
     signal_str = ", ".join(signals[:5])
 
@@ -297,5 +331,32 @@ if __name__ == "__main__":
     r = check_gl_account("6000 IT Equipment", "Uline", "")
     print("Weak/diff:", r["gl_status"])
     assert r["gl_status"] == GL_UNDETERMINED, "single weak signal must not flag mismatch"
+
+    # --- Gap 2 regressions ---------------------------------------------------
+    # 7) WB Mason office supplies booked to IT Equipment -> POSSIBLE_MISMATCH.
+    r = check_gl_account(
+        "6000 IT Equipment", "WB Mason",
+        "Copy Paper, Sticky Notes, File Folders",
+    )
+    print("WBMason->IT:", r["gl_status"], "| suggested:", r["gl_suggested"])
+    assert r["gl_status"] == GL_POSSIBLE_MISMATCH, "clean office miscode must flag"
+    assert r["gl_suggested"] == "Office Supplies"
+
+    # 8) Grainger network-rack: vendor->Maintenance vs IT-ish content competes
+    #    -> must REMAIN UNDETERMINED (do not over-tune into a flag).
+    r = check_gl_account(
+        "6300 Maintenance Supplies", "Grainger",
+        "network server rack enclosure, switch shelf",
+    )
+    print("Grainger rack:", r["gl_status"])
+    assert r["gl_status"] == GL_UNDETERMINED, "ambiguous rack row must stay undetermined"
+
+    # 9) Costco mixed bag: office + IT signals tie -> must REMAIN UNDETERMINED.
+    r = check_gl_account(
+        "8000 Office Supplies", "Costco Wholesale",
+        "copy paper, coffee, laptop stand, monitor",
+    )
+    print("Costco mixed:", r["gl_status"])
+    assert r["gl_status"] == GL_UNDETERMINED, "mixed-bag row must stay undetermined"
 
     print("\n[self-test] GL check: all assertions passed. [OK]")
