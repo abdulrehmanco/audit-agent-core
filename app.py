@@ -103,6 +103,8 @@ RESULT_COLUMNS = [
     ("status", "Status"),
     ("variance", "Variance"),
     ("matching_invoice_file", "Matching File"),
+    ("gl_status", "GL Check"),
+    ("gl_notes", "GL Notes"),
     ("audit_notes", "Audit Notes"),
 ]
 
@@ -384,6 +386,13 @@ def _render_results_table(results: list) -> None:
             )
     if "Matching File" in df:
         df["Matching File"] = df["Matching File"].fillna("—")
+    if "GL Check" in df:
+        # Prettify "GL_POSSIBLE_MISMATCH" -> "Possible Mismatch"; blank -> "—".
+        df["GL Check"] = df["GL Check"].apply(
+            lambda v: str(v).replace("GL_", "").replace("_", " ").title() if v else "—"
+        )
+    if "GL Notes" in df:
+        df["GL Notes"] = df["GL Notes"].fillna("")
 
     # Tint each row by its status (looked up before we restyle the cells).
     statuses = [str(r.get("status", "")).upper() for r in results]
@@ -415,7 +424,9 @@ def _render_results_table(results: list) -> None:
           white-space: normal; word-wrap: break-word; vertical-align: top;
           color: #1a1a1a;
       }
-      .audit-results td:nth-child(8) { min-width: 320px; }  /* Audit Notes */
+      /* GL Notes (col 9) and Audit Notes (col 10) get room while still wrapping */
+      .audit-results td:nth-child(9) { min-width: 220px; }
+      .audit-results td:nth-child(10) { min-width: 300px; }
     </style>
     """
     # A scroll container keeps very long runs manageable without truncating text.
@@ -463,6 +474,17 @@ def render_dashboard(reconciliation: dict, report_bytes: bytes) -> None:
             f"🔵 {dup_docs} duplicate document(s) detected (e.g. a scan of an "
             "already-recorded invoice) — informational only, not a payment risk."
         )
+
+    # --- Advisory GL account consistency check (third row of metrics) --------
+    st.markdown("**GL account consistency** (advisory — flags likely miscodings for review)")
+    g1, g2, g3 = st.columns(3)
+    g1.metric("✅ GL Consistent", summary.get("gl_consistent_count", 0))
+    g2.metric(
+        "🔎 GL Possible Mismatch",
+        summary.get("gl_possible_mismatch_count", 0),
+        help="Invoice content suggests a different account head than the one booked.",
+    )
+    g3.metric("➖ GL Undetermined", summary.get("gl_undetermined_count", 0))
 
     # Surface the tolerance applied so the on-screen view is self-documenting.
     abs_tol = summary.get("tolerance_absolute", 0.0)

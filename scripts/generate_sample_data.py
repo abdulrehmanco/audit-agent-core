@@ -39,6 +39,15 @@ def make_ledger() -> str:
             "Supplier Name": ["Acme Corp", "Globex LLC", "Initech", "Wayne Ent", "Acme Corp"],
             "Amount (USD)": [1250.00, 500.03, 3400.00, 750.00, 1250.00],
             "Inv. No.": ["INV-001", "INV-002", "INV-404", "INV-003", "INV-001"],
+            # GL Account head. Globex (row 2) is deliberately mis-booked to
+            # "IT Equipment" though its invoice is office supplies -> the GL check
+            # should flag GL_POSSIBLE_MISMATCH. Wayne is correctly booked to
+            # Maintenance Supplies -> GL_CONSISTENT.
+            "GL Account": [
+                "7200 Software Subscriptions", "6000 IT Equipment",
+                "6500 Shipping & Freight", "6300 Maintenance Supplies",
+                "7200 Software Subscriptions",
+            ],
             "Memo": ["", "", "", "", "duplicate booking?"],  # unmatched column, ignored
         }
     )
@@ -84,11 +93,13 @@ def main() -> None:
     invoices = [
         # (file, vendor, inv_no, date, line_items, total)
         ("acme_INV-001.pdf", "Acme Corporation", "INV-001", "15 Jan 2026",
-         [("Consulting services", 1000.00), ("Support retainer", 250.00)], 1250.00),
+         [("Annual software subscription, 25 seats", 1250.00)], 1250.00),
+        # Office supplies — but the ledger books this to "IT Equipment" -> mismatch.
         ("globex_INV-002.pdf", "Globex LLC", "INV-002", "16 Jan 2026",
-         [("Hardware components", 500.00)], 500.00),
+         [("Copy paper cases", 300.00), ("Toner cartridges and pens", 200.00)], 500.00),
+        # Maintenance content matching its booked head -> consistent.
         ("wayne_INV-003.pdf", "Wayne Enterprises", "INV-003", "17 Jan 2026",
-         [("Security systems", 900.00)], 900.00),
+         [("Facility maintenance and repair parts", 900.00)], 900.00),
         ("umbrella_INV-777.pdf", "Umbrella Inc", "INV-777", "20 Jan 2026",
          [("Lab equipment", 9999.99)], 9999.99),
     ]

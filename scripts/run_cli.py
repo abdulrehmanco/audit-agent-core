@@ -102,13 +102,18 @@ def main() -> int:
     s = rec["summary"]
     print(f"  verified={s['verified_count']}  within_tol={s['verified_within_tolerance_count']}  "
           f"exceptions={s['exception_count']}  missing={s['missing_doc_count']}")
-    print(f"  duplicates={s['potential_duplicate_count']}  unrecorded={s['unrecorded_invoice_count']}  "
-          f"errors={s['processing_error_count']}")
+    print(f"  dup_claims={s['potential_duplicate_count']}  dup_docs={s.get('duplicate_document_count', 0)}  "
+          f"unrecorded={s['unrecorded_invoice_count']}  errors={s['processing_error_count']}")
+    print(f"  GL: consistent={s.get('gl_consistent_count', 0)}  "
+          f"possible_mismatch={s.get('gl_possible_mismatch_count', 0)}  "
+          f"undetermined={s.get('gl_undetermined_count', 0)}")
     print("\n  Per-line results:")
     for r in rec["results"]:
         row = r["ledger_row_index"] if r["ledger_row_index"] is not None else "—"
+        gl = r.get("gl_status", "")
+        gl_str = f"  GL={gl}" + (f"->{r['gl_suggested']}" if r.get("gl_suggested") else "") if gl else ""
         print(f"   [{r['status']:26}] row={row} {r['ledger_vendor']!r} "
-              f"${r['ledger_amount']:,.2f} var={r['variance']:,.2f}")
+              f"${r['ledger_amount']:,.2f} var={r['variance']:,.2f}{gl_str}")
 
     # --- Step 4: write the workpaper ----------------------------------------
     out_path = report_gen.generate_audit_report(rec, args.out)

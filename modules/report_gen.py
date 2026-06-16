@@ -83,8 +83,17 @@ COLUMN_SPEC: list[dict[str, str]] = [
     {"header": "Status", "key": "status", "kind": "status"},
     {"header": "Variance", "key": "variance", "kind": "money"},
     {"header": "Matching File", "key": "matching_invoice_file", "kind": "text"},
+    {"header": "GL Check", "key": "gl_status", "kind": "gl_status"},
+    {"header": "GL Notes", "key": "gl_notes", "kind": "notes"},
     {"header": "Audit Notes", "key": "audit_notes", "kind": "notes"},
 ]
+
+# Soft pastel fills for the advisory GL check column.
+GL_FILLS: dict[str, str] = {
+    "GL_CONSISTENT": "FFE2EFDA",        # soft green
+    "GL_POSSIBLE_MISMATCH": "FFFCE4D6",  # soft red — needs review
+    "GL_UNDETERMINED": "FFF2F2F2",       # near-white grey — no judgement
+}
 
 # Map each status to its conditional-formatting fill.
 STATUS_FILLS: dict[str, str] = {
@@ -168,10 +177,11 @@ def _auto_fit_columns(ws: Worksheet, max_rows_scanned: int | None = None) -> Non
         ws: The worksheet to size.
         max_rows_scanned: Optional cap on how many rows to scan (defaults to all).
     """
-    notes_col_idx = next(
-        (i for i, c in enumerate(COLUMN_SPEC, start=1) if c["kind"] == "notes"),
-        None,
-    )
+    # All "notes"-kind columns wrap rather than run unbounded (there can be more
+    # than one, e.g. GL Notes and Audit Notes).
+    notes_col_idxs = {
+        i for i, c in enumerate(COLUMN_SPEC, start=1) if c["kind"] == "notes"
+    }
 
     widths: dict[int, int] = {}
     for row in ws.iter_rows():
@@ -187,7 +197,7 @@ def _auto_fit_columns(ws: Worksheet, max_rows_scanned: int | None = None) -> Non
     for col_idx, raw_width in widths.items():
         # A little padding for breathing room.
         width = raw_width + 3
-        if col_idx == notes_col_idx:
+        if col_idx in notes_col_idxs:
             width = min(width, NOTES_WRAP_WIDTH)
         width = max(MIN_COL_WIDTH, min(width, MAX_COL_WIDTH))
         ws.column_dimensions[get_column_letter(col_idx)].width = width
@@ -286,6 +296,9 @@ def _build_summary(ws: Worksheet, summary: dict, start_row: int) -> int:
         ("Duplicate Documents (informational)", summary.get("duplicate_document_count", 0)),
         ("Unrecorded Invoices (completeness)", summary.get("unrecorded_invoice_count", 0)),
         ("Processing Errors (tooling)", summary.get("processing_error_count", 0)),
+        ("GL Consistent", summary.get("gl_consistent_count", 0)),
+        ("GL Possible Mismatch (review)", summary.get("gl_possible_mismatch_count", 0)),
+        ("GL Undetermined", summary.get("gl_undetermined_count", 0)),
         ("Tolerance Applied", f"± ${abs_tol:,.2f}  /  {rel_tol_pct:.3g}%"),
     ]
 
@@ -350,9 +363,11 @@ def _build_table(ws: Worksheet, results: list, start_row: int) -> int:
             value = result.get(spec["key"])
 
             if kind == "money":
+                # Quantize to cents on write so binary float noise (e.g.
+                # 921.0700000000001) can never appear in the workbook cell.
                 _set_cell(
                     ws, row, col_idx,
-                    float(value) if isinstance(value, (int, float)) else 0.0,
+                    round(float(value), 2) if isinstance(value, (int, float)) else 0.0,
                     font=base_font, alignment=right, number_format=CURRENCY_FORMAT,
                 )
             elif kind == "int":
@@ -367,6 +382,18 @@ def _build_table(ws: Worksheet, results: list, start_row: int) -> int:
                 _set_cell(
                     ws, row, col_idx, status,
                     font=status_font, fill=status_fill, alignment=center,
+                )
+            elif kind == "gl_status":
+                gl_val = str(value or "")
+                gl_fill = (
+                    PatternFill("solid", fgColor=GL_FILLS[gl_val])
+                    if gl_val in GL_FILLS
+                    else None
+                )
+                _set_cell(
+                    ws, row, col_idx,
+                    gl_val.replace("GL_", "").replace("_", " ").title() if gl_val else "—",
+                    font=base_font, fill=gl_fill, alignment=center,
                 )
             elif kind == "notes":
                 _set_cell(
@@ -480,6 +507,9 @@ if __name__ == "__main__":
             "duplicate_document_count": 1,
             "unrecorded_invoice_count": 1,
             "processing_error_count": 1,
+            "gl_consistent_count": 1,
+            "gl_possible_mismatch_count": 1,
+            "gl_undetermined_count": 0,
             "tolerance_absolute": 0.05,
             "tolerance_relative_pct": 0.005,
         },
@@ -488,11 +518,16 @@ if __name__ == "__main__":
              "ledger_amount": 1250.00, "ledger_invoice_no": "INV-001",
              "status": "VERIFIED", "variance": 0.0,
              "matching_invoice_file": "acme_inv_001.pdf",
+             "gl_status": "GL_CONSISTENT", "gl_booked": "IT Equipment",
+             "gl_suggested": "", "gl_notes": "Invoice content aligns with booked head.",
              "audit_notes": "VERIFIED: amount ties to the penny; invoice no. and vendor match."},
             {"ledger_row_index": 3, "ledger_vendor": "Globex LLC",
              "ledger_amount": 500.03, "ledger_invoice_no": "INV-002",
              "status": "VERIFIED_WITHIN_TOLERANCE", "variance": 0.03,
              "matching_invoice_file": "globex_inv_002.pdf",
+             "gl_status": "GL_POSSIBLE_MISMATCH", "gl_booked": "IT Equipment",
+             "gl_suggested": "Office Supplies",
+             "gl_notes": "Booked to 'IT Equipment' but content suggests 'Office Supplies'.",
              "audit_notes": "VERIFIED WITHIN TOLERANCE: $0.03 variance within ±$2.50 (likely tax/rounding)."},
             {"ledger_row_index": 4, "ledger_vendor": "Wayne Ent",
              "ledger_amount": 750.00, "ledger_invoice_no": "INV-003",
@@ -594,5 +629,16 @@ if __name__ == "__main__":
         "Invoice-driven rows must render '—' for the missing ledger row index."
     )
 
-    print("[self-test] Disclaimer, all 7 status colors, currency & layout verified. [OK]")
+    # GL Check column: row 2 (CONSISTENT) and row 3 (POSSIBLE MISMATCH) carry the
+    # right text + fill; the mismatch is the soft-red review color.
+    gl_col = next(
+        i for i, s in enumerate(COLUMN_SPEC, start=1) if s["key"] == "gl_status"
+    )
+    gl_consistent_cell = ws_check.cell(row=header_row + 1, column=gl_col)
+    gl_mismatch_cell = ws_check.cell(row=header_row + 2, column=gl_col)
+    assert gl_consistent_cell.value == "Consistent", gl_consistent_cell.value
+    assert gl_mismatch_cell.value == "Possible Mismatch", gl_mismatch_cell.value
+    assert gl_mismatch_cell.fill.fgColor.rgb == GL_FILLS["GL_POSSIBLE_MISMATCH"]
+
+    print("[self-test] Disclaimer, 8 status colors, GL column, currency & layout verified. [OK]")
     print("[self-test] Open the file in Excel to view the styled workpaper.")

@@ -61,6 +61,12 @@ import logging
 import re
 from typing import Any, Optional
 
+# GL account consistency check (advisory; additive — never alters match Status).
+try:
+    from . import gl_check
+except ImportError:  # pragma: no cover - support running as a loose script
+    import gl_check  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Fuzzy matching dependency (used only to LOCATE candidates, never to judge money).
 # ---------------------------------------------------------------------------
@@ -330,6 +336,11 @@ def _base_row(ledger: dict) -> dict:
         "variance": 0.0,
         "matching_invoice_file": None,
         "audit_notes": "",
+        # GL consistency fields default empty; filled in for matched rows only.
+        "gl_status": "",
+        "gl_booked": "",
+        "gl_suggested": "",
+        "gl_notes": "",
     }
 
 
@@ -372,6 +383,15 @@ def _evaluate_matched_line(
     """
     result = _base_row(ledger)
     result["matching_invoice_file"] = _invoice_file_ref(invoice)
+
+    # Advisory GL account consistency check (additive — never affects `status`).
+    # Run on every matched row using the booked head vs the invoice content.
+    gl = gl_check.check_gl_account(
+        ledger.get("gl_account"),
+        invoice.get("vendor_name"),
+        invoice.get("line_items"),
+    )
+    result.update(gl)
 
     led_amount = detail["led_amount"]
     inv_amount = detail["inv_amount"]
@@ -516,6 +536,7 @@ def _duplicate_document_result(invoice: dict) -> dict:
         "status": STATUS_DUPLICATE_DOCUMENT,
         "variance": 0.0,
         "matching_invoice_file": _invoice_file_ref(invoice),
+        "gl_status": "", "gl_booked": "", "gl_suggested": "", "gl_notes": "",
         "audit_notes": (
             "DUPLICATE DOCUMENT (informational): this invoice file carries the same "
             f"invoice number ('{invoice.get('invoice_number')}') as an invoice "
@@ -537,6 +558,7 @@ def _unrecorded_result(invoice: dict) -> dict:
         "status": STATUS_UNRECORDED,
         "variance": inv_amount if inv_amount is not None else 0.0,
         "matching_invoice_file": _invoice_file_ref(invoice),
+        "gl_status": "", "gl_booked": "", "gl_suggested": "", "gl_notes": "",
         "audit_notes": (
             "COMPLETENESS RISK: this invoice was uploaded but could not be matched "
             "to any ledger line — a potential unrecorded liability / unbooked "
@@ -558,6 +580,7 @@ def _processing_error_result(invoice: dict) -> dict:
         "status": STATUS_PROCESSING_ERROR,
         "variance": 0.0,
         "matching_invoice_file": _invoice_file_ref(invoice),
+        "gl_status": "", "gl_booked": "", "gl_suggested": "", "gl_notes": "",
         "audit_notes": (
             f"AI EXTRACTION FAILURE ({detail}). This document could not be read or "
             "parsed by the OCR/AI stage and was therefore NOT included in matching. "
@@ -705,6 +728,17 @@ def reconcile_ledger_with_invoices(
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
 
+    # Advisory GL-check tally (only matched rows carry a non-empty gl_status).
+    gl_counts = {
+        gl_check.GL_CONSISTENT: 0,
+        gl_check.GL_POSSIBLE_MISMATCH: 0,
+        gl_check.GL_UNDETERMINED: 0,
+    }
+    for r in results:
+        gs = r.get("gl_status")
+        if gs:
+            gl_counts[gs] = gl_counts.get(gs, 0) + 1
+
     summary = {
         "total_ledger_records": ledger_result_count,
         "total_invoices": len(invoice_data),
@@ -719,6 +753,10 @@ def reconcile_ledger_with_invoices(
         "duplicate_document_count": counts[STATUS_DUPLICATE_DOCUMENT],
         "unrecorded_invoice_count": counts[STATUS_UNRECORDED],
         "processing_error_count": counts[STATUS_PROCESSING_ERROR],
+        # Advisory GL account consistency counts (matched rows only).
+        "gl_consistent_count": gl_counts[gl_check.GL_CONSISTENT],
+        "gl_possible_mismatch_count": gl_counts[gl_check.GL_POSSIBLE_MISMATCH],
+        "gl_undetermined_count": gl_counts[gl_check.GL_UNDETERMINED],
         "tolerance_absolute": round(absolute_tolerance, MONEY_PRECISION),
         "tolerance_relative_pct": relative_tolerance_pct,
     }
@@ -786,6 +824,18 @@ if __name__ == "__main__":
         #     KEY PRECEDENCE must return VERIFIED, not EXCEPTION.
         {"ledger_row_index": 12, "ledger_vendor": "HP Inc",
          "ledger_amount": 33450.00, "ledger_invoice_no": "INV-HP-90120"},
+        # 12) Costco penny-exact regression (carry-over fix A): 921.07 vs 921.07
+        #     from a float-noisy operand must be VERIFIED with variance 0.00.
+        {"ledger_row_index": 13, "ledger_vendor": "Costco",
+         "ledger_amount": 921.0700000000001, "ledger_invoice_no": "INV-CST-80451"},
+        # 13) GL check CONSISTENT: AWS cloud line items booked to Cloud Hosting.
+        {"ledger_row_index": 14, "ledger_vendor": "Amazon Web Services",
+         "ledger_amount": 2000.00, "ledger_invoice_no": "INV-AWSGL-1",
+         "gl_account": "7100 Cloud Hosting"},
+        # 14) GL check POSSIBLE_MISMATCH: office paper booked to IT Equipment.
+        {"ledger_row_index": 15, "ledger_vendor": "Staples",
+         "ledger_amount": 300.00, "ledger_invoice_no": "INV-STGL-1",
+         "gl_account": "6000 IT Equipment"},
     ]
 
     mock_invoices = [
@@ -817,6 +867,16 @@ if __name__ == "__main__":
         # totally different as a string but invoice no. + amount tie out exactly.
         {"vendor_name": "Hewlett-Packard", "invoice_number": "INV-HP-90120",
          "total_amount": 33450.00, "source_file": "hp_90120.pdf"},
+        # Penny-exact partner for the Costco float-rounding row (row 13).
+        {"vendor_name": "Costco", "invoice_number": "INV-CST-80451",
+         "total_amount": 921.07, "source_file": "costco.pdf"},
+        # GL partners: content drives the category inference.
+        {"vendor_name": "Amazon Web Services", "invoice_number": "INV-AWSGL-1",
+         "total_amount": 2000.00, "source_file": "aws_gl.pdf",
+         "line_items": "EC2 compute, S3 storage, data egress"},
+        {"vendor_name": "Staples", "invoice_number": "INV-STGL-1",
+         "total_amount": 300.00, "source_file": "staples_gl.pdf",
+         "line_items": "Copy paper cases, toner cartridges, pens"},
         # Flagged by OCR as unreadable -> PROCESSING_ERROR (NOT missing doc)
         {"vendor_name": None, "invoice_number": None, "total_amount": None,
          "source_file": "blurry_scan.pdf",
@@ -829,8 +889,8 @@ if __name__ == "__main__":
     print(json.dumps(report, indent=2))
 
     s = report["summary"]
-    assert s["total_ledger_records"] == 11
-    assert s["verified_count"] == 5, "Acme, Dell, Uline, Comcast, HP(acronym)"
+    assert s["total_ledger_records"] == 14
+    assert s["verified_count"] == 8, "incl. HP, Costco, AWS-GL, Staples-GL"
     assert s["verified_within_tolerance_count"] == 1, "one VERIFIED_WITHIN_TOLERANCE"
     assert s["exception_count"] == 1, "one EXCEPTION"
     assert s["missing_doc_count"] == 2, "Initech + LinkedIn (no false match)"
@@ -861,6 +921,21 @@ if __name__ == "__main__":
     # Key precedence: acronym vendor (~29%) verifies on exact invoice# + amount.
     assert by_row[12]["status"] == "VERIFIED", "key precedence must verify HP acronym"
     assert "vendor name differs" in by_row[12]["audit_notes"], "must log vendor note"
+    # Fix A: Costco penny-exact from float noise -> VERIFIED, variance exactly 0.00.
+    assert by_row[13]["status"] == "VERIFIED" and by_row[13]["variance"] == 0.0
+
+    # --- GL feature: advisory check is additive (Status unchanged) -----------
+    # AWS cloud line items booked to Cloud Hosting -> CONSISTENT.
+    assert by_row[14]["status"] == "VERIFIED", "GL check must not alter match Status"
+    assert by_row[14]["gl_status"] == "GL_CONSISTENT"
+    # Office paper booked to IT Equipment -> POSSIBLE_MISMATCH suggesting Office Supplies.
+    assert by_row[15]["status"] == "VERIFIED", "GL check must not alter match Status"
+    assert by_row[15]["gl_status"] == "GL_POSSIBLE_MISMATCH"
+    assert by_row[15]["gl_suggested"] == "Office Supplies"
+    # Rows with no booked GL account stay GL_UNDETERMINED (e.g. row 2).
+    assert by_row[2]["gl_status"] == "GL_UNDETERMINED"
+    # Summary GL tally present.
+    assert s["gl_consistent_count"] >= 1 and s["gl_possible_mismatch_count"] >= 1
 
     # The scanned copy is a DUPLICATE_DOCUMENT (informational), NOT a payment
     # claim and NOT unrecorded.

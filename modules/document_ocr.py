@@ -137,6 +137,8 @@ EMPTY_INVOICE: dict[str, Any] = {
     "invoice_number": None,
     "date": None,
     "total_amount": None,
+    "line_items": None,    # what was purchased (for GL categorization)
+    "bill_to_name": None,  # the buyer — captured only to keep it OUT of vendor_name
 }
 
 # DPI used when rasterizing a scanned PDF page for Tesseract. 300 is the sweet
@@ -169,18 +171,34 @@ SYSTEM_PROMPT: str = (
     '  - "total_amount": the final total amount due as a number (float). '
     "Strip any currency symbols, thousands separators, and whitespace. "
     "Do NOT return a string for this field.\n\n"
+    '  - "line_items": a short plain-text summary of WHAT was purchased — the '
+    "item/service descriptions only (e.g. 'EC2 compute, S3 storage, data "
+    "egress'). Join multiple items with commas. Used for expense categorization. "
+    "null if none are legible.\n"
+    '  - "bill_to_name": the CUSTOMER/recipient company (the one under "Bill To", '
+    '"Sold To", "Ship To", "Customer", or "Buyer"), or null. This field exists '
+    "ONLY to keep the buyer OUT of vendor_name — extract it separately so you do "
+    "not confuse it with the seller.\n\n"
     "Rules:\n"
     "  1. Return ONLY the JSON object. No prose, no explanations, no markdown, "
     "no ```json code fences.\n"
     "  2. If a field cannot be found or is ambiguous, set its value to null.\n"
     "  3. The JSON keys must be exactly: vendor_name, invoice_number, date, "
-    "total_amount.\n"
+    "total_amount, line_items, bill_to_name.\n"
     "  4. total_amount must be a JSON number or null — never a quoted string.\n"
     "  5. Extract ONLY from the document text provided below — never invent or "
-    "reuse a company name that does not appear in this document.\n\n"
+    "reuse a company name that does not appear in this document.\n"
+    "  6. vendor_name and bill_to_name must be DIFFERENT companies. vendor_name "
+    "is the seller/issuer; bill_to_name is the buyer. Never put the Bill-To "
+    "company in vendor_name.\n\n"
+    "Worked example — given an invoice whose header says 'DocuSign, Inc.' and "
+    "whose 'Bill To:' block says 'Brightwater Logistics Inc.', the correct output "
+    'is vendor_name="DocuSign, Inc." and bill_to_name="Brightwater Logistics '
+    'Inc." — NOT the other way around.\n\n'
     "Output schema (shape only):\n"
     '{"vendor_name": "string or null", "invoice_number": "string or null", '
-    '"date": "string or null", "total_amount": 0.0}'
+    '"date": "string or null", "total_amount": 0.0, '
+    '"line_items": "string or null", "bill_to_name": "string or null"}'
 )
 
 
@@ -346,12 +364,28 @@ def _coerce_invoice_schema(payload: dict[str, Any]) -> dict[str, Any]:
     """
     result = dict(EMPTY_INVOICE)
 
-    for key in ("vendor_name", "invoice_number", "date"):
+    for key in ("vendor_name", "invoice_number", "date", "line_items", "bill_to_name"):
         value = payload.get(key)
         if value is None:
             continue
+        # The model may return line_items as a list — join into a single string.
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(str(v).strip() for v in value if str(v).strip())
         text = str(value).strip()
         result[key] = text or None
+
+    # Safety net: if the model still placed the buyer in vendor_name (vendor ==
+    # bill_to), drop the vendor so a wrong value never propagates silently.
+    if (
+        result["vendor_name"]
+        and result["bill_to_name"]
+        and result["vendor_name"].strip().lower() == result["bill_to_name"].strip().lower()
+    ):
+        logger.warning(
+            "Vendor equals bill-to (%r); clearing vendor_name to avoid using the buyer.",
+            result["vendor_name"],
+        )
+        result["vendor_name"] = None
 
     # total_amount -> float | None, tolerating "$1,234.50"-style strings.
     # Always quantize to cents so a clean amount is never carried with binary
@@ -569,20 +603,44 @@ if __name__ == "__main__":
     assert _parse_model_json("not json at all") == EMPTY_INVOICE, "Bad JSON -> empty shape."
     print("  JSON enforcement / coercion assertions passed.\n")
 
-    # 2) Show the full live path *only* if real credentials & file are provided
-    #    via environment variables; otherwise just describe what would happen.
-    demo_key = os.environ.get("GROQ_API_KEY")
-    demo_file = os.environ.get("AUDIT_DEMO_INVOICE")
-    if demo_key and demo_file:
-        print(f"[demo] Live call: extracting {demo_file} via Groq {GROQ_MODEL} ...\n")
-        live_result = extract_invoice_data(demo_file, demo_key)
-        print(f"  Result -> {live_result}")
+    # 2) LIVE regression for Fix B (vendor must be the seller, NOT the Bill-To).
+    #    Runs only when a real Groq key is configured (.env) and PyMuPDF is present.
+    if get_groq_api_key() and fitz is not None:
+        import tempfile
+
+        print("[demo] Live Fix-B check: vendor must NOT be the Bill-To company...\n")
+        tmp = tempfile.mkdtemp(prefix="ocr_billto_")
+        pdf_path = os.path.join(tmp, "docusign_billto.pdf")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text(
+            (72, 90),
+            "\n".join([
+                "DocuSign, Inc.", "221 Main Street, San Francisco, CA", "",
+                "INVOICE", "Invoice #: INV-DS-60540", "Date: 12 Mar 2026", "",
+                "Bill To:", "Brightwater Logistics Inc.", "500 Harbor Blvd", "",
+                "Description                 Amount",
+                "eSignature annual plan, 50 seats   4800.00",
+                "----------------------------------",
+                "TOTAL DUE                          4800.00",
+            ]),
+            fontsize=11, fontname="courier",
+        )
+        doc.save(pdf_path)
+        doc.close()
+
+        res = extract_invoice_data(pdf_path)
+        print(f"  vendor_name={res['vendor_name']!r}  bill_to_name={res['bill_to_name']!r}")
+        assert res["vendor_name"] and "docusign" in res["vendor_name"].lower(), (
+            f"Vendor must be the seller (DocuSign), got {res['vendor_name']!r}"
+        )
+        assert "brightwater" not in (res["vendor_name"] or "").lower(), (
+            "Vendor must NOT be the Bill-To company (Brightwater)."
+        )
+        print("  Fix-B live check passed: seller extracted, bill-to excluded.\n")
     else:
         print(
-            "[demo] Set GROQ_API_KEY and AUDIT_DEMO_INVOICE env vars to run a real\n"
-            "       end-to-end extraction. With a fake key the call would hit the\n"
-            f"       Groq endpoint and surface an auth error, while a 429 would be\n"
-            "       caught and logged as a backoff warning.\n"
+            "[demo] (Skipping live Fix-B check — set GROQ_API_KEY in .env to run it.)\n"
         )
 
     print("[demo] Module is wired correctly. [OK]")

@@ -62,6 +62,12 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "vendor": ["vendor", "supplier", "payee", "vendor_name", "description"],
     "amount": ["amount", "amount_usd", "total", "debit", "value"],
     "invoice_no": ["invoice_no", "invoice_number", "inv_no", "reference", "ref_no"],
+    # Optional: the GL account head a line was booked to (for the GL consistency
+    # check). Not required — absent simply yields GL_UNDETERMINED downstream.
+    "gl_account": [
+        "gl_account", "account", "gl_head", "account_head", "gl",
+        "account_name", "ledger_account", "gl_code", "gl_account_head",
+    ],
 }
 
 # Columns the comparison engine cannot run without. If we can't locate these,
@@ -401,6 +407,8 @@ def parse_general_ledger(file_path: str, target_sheet: str = None) -> list:
                 "vendor": vendor,
                 "amount": amount,
                 "invoice_no": _clean_reference(row.get("invoice_no")),
+                # Optional GL account head (empty string if the column is absent).
+                "gl_account": _clean_reference(row.get("gl_account")),
             }
             records.append(record)
         except Exception as exc:  # noqa: BLE001 - never let one bad row abort the run.
