@@ -100,6 +100,38 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 GROQ_MODEL: str = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+# Automatic model fallback chain. If the primary model is rate-limited (HTTP 429
+# — Groq's free-tier daily caps are PER-MODEL) or unavailable (HTTP 404 / model
+# decommissioned), the next model is tried transparently, so neither a daily cap
+# nor a retired model ID ever stops a run. All must be JSON-mode compatible.
+#   - Override the whole chain with GROQ_MODEL_FALLBACKS (comma-separated).
+#   - Setting GROQ_MODEL just changes which model is tried FIRST.
+_DEFAULT_FALLBACK_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-120b",
+]
+
+
+def get_model_chain() -> list[str]:
+    """
+    Return the ordered list of models to try, primary first.
+
+    The primary is GROQ_MODEL; fallbacks come from GROQ_MODEL_FALLBACKS (if set)
+    or the built-in defaults. Duplicates are removed while preserving order.
+    """
+    fb_env = (os.environ.get("GROQ_MODEL_FALLBACKS") or "").strip()
+    fallbacks = (
+        [m.strip() for m in fb_env.split(",") if m.strip()]
+        if fb_env
+        else list(_DEFAULT_FALLBACK_MODELS)
+    )
+    chain: list[str] = []
+    for model in [GROQ_MODEL, *fallbacks]:
+        if model and model not in chain:
+            chain.append(model)
+    return chain
+
+
 # A placeholder key (from the shipped .env template) must never be treated as a
 # real credential — guard against the common "I forgot to fill it in" mistake.
 _PLACEHOLDER_KEYS = {"", "your_groq_api_key_here", "gsk_xxx", "changeme"}
@@ -500,55 +532,82 @@ def extract_invoice_data(file_path: str, groq_api_key: str | None = None) -> dic
     # --- 1. Local text extraction (fitz first, OCR fallback) -----------------
     raw_text = _extract_raw_text(file_path)
 
-    # --- 2. Structured extraction via Groq -----------------------------------
+    # --- 2. Structured extraction via Groq (with automatic model fallback) ----
     client = Groq(api_key=groq_api_key)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "Extract the invoice fields from the following raw document text "
+                "and return ONLY the JSON object:\n\n"
+                "-----BEGIN DOCUMENT-----\n"
+                f"{raw_text}\n"
+                "-----END DOCUMENT-----"
+            ),
+        },
+    ]
 
-    try:
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            temperature=0.0,  # deterministic extraction
-            response_format={"type": "json_object"},  # force a JSON object back
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Extract the invoice fields from the following raw "
-                        "document text and return ONLY the JSON object:\n\n"
-                        "-----BEGIN DOCUMENT-----\n"
-                        f"{raw_text}\n"
-                        "-----END DOCUMENT-----"
-                    ),
-                },
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001 - inspect, log, and degrade gracefully.
-        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
-        # Groq/OpenAI-style SDKs expose 429 either as a typed RateLimitError or
-        # via a status_code attribute; check both the type name and the code.
-        is_rate_limited = status == 429 or "ratelimit" in type(exc).__name__.lower()
-        if is_rate_limited:
-            logger.warning(
-                "Groq API rate limit hit (HTTP 429) while processing %s. "
-                "Downstream loop should back off and retry. Detail: %s",
-                file_path,
-                exc,
+    chain = get_model_chain()
+    completion = None
+    used_model = None
+    attempt_errors: list[str] = []
+
+    for model in chain:
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                temperature=0.0,  # deterministic extraction
+                response_format={"type": "json_object"},  # force a JSON object back
+                messages=messages,
             )
-        else:
-            logger.error("Groq API call failed for %s: %s", file_path, exc)
-        # Return the empty shape flagged as a TOOLING failure so the match engine
-        # surfaces it as PROCESSING_ERROR rather than a false MISSING_DOC.
+            used_model = model
+            break
+        except Exception as exc:  # noqa: BLE001 - inspect, log, try the next model.
+            status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+            ename = type(exc).__name__.lower()
+            is_rate_limited = status == 429 or "ratelimit" in ename
+            is_unavailable = status == 404 or "notfound" in ename
+            is_auth = status in (401, 403)
+            attempt_errors.append(f"{model}: {type(exc).__name__}: {exc}")
+
+            if is_rate_limited:
+                logger.warning(
+                    "Model %s rate-limited (HTTP 429) on %s — falling back to the "
+                    "next model.", model, file_path,
+                )
+            elif is_unavailable:
+                logger.warning(
+                    "Model %s unavailable (HTTP 404) on %s — falling back to the "
+                    "next model.", model, file_path,
+                )
+            else:
+                logger.error("Model %s failed on %s: %s", model, file_path, exc)
+
+            # An auth error affects every model — stop trying the rest.
+            if is_auth:
+                logger.error("Groq auth error (HTTP %s) — aborting fallback chain.", status)
+                break
+            continue
+
+    if completion is None:
+        # Every model in the chain failed -> surface as a TOOLING failure so the
+        # match engine reports PROCESSING_ERROR rather than a false MISSING_DOC.
         failed = dict(EMPTY_INVOICE)
         failed["processing_error"] = True
         failed["error_detail"] = (
-            f"Groq API rate limit (HTTP 429): {exc}"
-            if is_rate_limited
-            else f"Groq API call failed: {type(exc).__name__}: {exc}"
+            "Groq API call failed for all models in the fallback chain "
+            f"({' | '.join(attempt_errors)})"
         )
+        logger.error("All %d model(s) failed for %s.", len(chain), file_path)
         return failed
+
+    if used_model != chain[0]:
+        logger.info("Extracted %s using fallback model %s.", file_path, used_model)
 
     content = completion.choices[0].message.content
     result = _parse_model_json(content)
+    result["model_used"] = used_model  # audit trail / reproducibility
 
     # If the model returned nothing usable, treat it as a processing failure
     # (needs human review) rather than letting a blank record flow downstream.
