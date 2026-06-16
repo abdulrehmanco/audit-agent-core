@@ -7,6 +7,3 @@ pythonVersion = "3.11"
 # unlike CSS hacks, it does NOT break the mobile sidebar-open control.
 toolbarMode = "minimal"
 
-[theme]
-# This hides the footer and burger menu visually
-base = "light"
