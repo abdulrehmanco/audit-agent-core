@@ -117,25 +117,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Hide Streamlit's default chrome (top-right toolbar incl. the GitHub "Fork"
-# button and hamburger menu, plus the bottom "Made with Streamlit" badge/footer)
-# for a clean, white-labelled look. We deliberately do NOT hide the whole header
-# so the mobile sidebar-open control still works.
-_HIDE_STREAMLIT_CHROME = """
+# Hide ONLY the bottom "Made with / Hosted with Streamlit" badge and footer.
+# (The top toolbar / GitHub "Fork" / menu are hidden via .streamlit/config.toml
+# `toolbarMode = "minimal"`, which is the supported way and does NOT break the
+# mobile sidebar control.) These selectors are intentionally narrow so they
+# never touch the header or sidebar.
+_HIDE_STREAMLIT_BADGE = """
     <style>
-      [data-testid="stToolbar"] {display: none !important;}
-      #MainMenu {visibility: hidden !important;}
-      [data-testid="stStatusWidget"] {display: none !important;}
-      [data-testid="stDecoration"] {display: none !important;}
       footer {visibility: hidden !important; height: 0 !important;}
-      /* "Hosted with / Made with Streamlit" viewer badge (class names vary by
-         version, so match broadly) */
-      [class*="viewerBadge"] {display: none !important;}
+      [class*="viewerBadge"],
+      [class*="profileContainer"],
+      [data-testid="stAppCreatorAvatar"] {display: none !important;}
       a[href*="streamlit.io/cloud"],
-      a[href*="share.streamlit.io"] {display: none !important;}
+      a[href*="share.streamlit.io"],
+      a[href^="https://streamlit.io"] {display: none !important;}
     </style>
 """
-st.markdown(_HIDE_STREAMLIT_CHROME, unsafe_allow_html=True)
+st.markdown(_HIDE_STREAMLIT_BADGE, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------

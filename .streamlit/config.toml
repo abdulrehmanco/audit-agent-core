@@ -1,2 +1,8 @@
 [server]
 pythonVersion = "3.11"
+
+[client]
+# Hide the top-right toolbar (hamburger menu, "Deploy", and on Streamlit Cloud
+# the GitHub "Fork" button). This is the supported way to remove that chrome and,
+# unlike CSS hacks, it does NOT break the mobile sidebar-open control.
+toolbarMode = "minimal"
