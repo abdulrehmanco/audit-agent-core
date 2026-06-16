@@ -527,13 +527,23 @@ def main() -> None:
 
     st.title(f"🧾 {APP_NAME}")
     st.markdown(
-        "Automated **substantive testing** — vouch a client's General Ledger "
-        "against their source invoices (bidirectionally, for both existence and "
-        "completeness) and produce a styled audit workpaper in seconds."
+        "Upload a company's accounting records (the **ledger**) and its **invoices**, "
+        "and this tool automatically checks that they match. "
+        "It instantly flags problems — wrong amounts, missing paperwork, possible "
+        "double payments, and miscoded expenses — and hands you a ready-to-use report."
     )
 
     # --- Upload section ------------------------------------------------------
     st.subheader("1 · Upload Source Files")
+
+    # File uploaders can only be emptied by recreating them with a new `key`, so
+    # we keep a counter per uploader and bump it when "Clear" is clicked. That
+    # resets the widget to zero files in one click instead of removing each X.
+    if "ledger_uploader_id" not in st.session_state:
+        st.session_state.ledger_uploader_id = 0
+    if "invoice_uploader_id" not in st.session_state:
+        st.session_state.invoice_uploader_id = 0
+
     up_col1, up_col2 = st.columns(2)
 
     with up_col1:
@@ -542,7 +552,13 @@ def main() -> None:
             type=["xlsx"],
             accept_multiple_files=False,
             help="The client's exported General Ledger workbook.",
+            key=f"ledger_{st.session_state.ledger_uploader_id}",
         )
+        if ledger_upload is not None and st.button(
+            "✕ Clear ledger", key="clear_ledger", use_container_width=True
+        ):
+            st.session_state.ledger_uploader_id += 1
+            st.rerun()
 
     with up_col2:
         invoice_uploads = st.file_uploader(
@@ -550,12 +566,20 @@ def main() -> None:
             type=SUPPORTED_INVOICE_TYPES,
             accept_multiple_files=True,
             help="Drag-and-drop one or more supporting invoice documents.",
+            key=f"invoices_{st.session_state.invoice_uploader_id}",
         )
+        if invoice_uploads and st.button(
+            f"✕ Clear all {len(invoice_uploads)} invoice(s)",
+            key="clear_invoices",
+            use_container_width=True,
+        ):
+            st.session_state.invoice_uploader_id += 1
+            st.rerun()
 
     # --- Execution -----------------------------------------------------------
     st.subheader("2 · Run the Vouching Engine")
     run_clicked = st.button(
-        "🚀 Run Automated Ledger-to-Invoice Vouching",
+        "Run Automated Ledger-to-Invoice Vouching",
         type="primary",
         use_container_width=True,
     )
