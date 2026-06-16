@@ -120,8 +120,15 @@ STATUS_PROCESSING_ERROR = "PROCESSING_ERROR"
 # ---------------------------------------------------------------------------
 # Tunable thresholds (deterministic, documented, version-controlled).
 # ---------------------------------------------------------------------------
-VENDOR_MATCH_THRESHOLD: int = 88          # vendor similarity for a clean match
-VENDOR_CANDIDATE_THRESHOLD: int = 70      # vendor similarity to even be a candidate
+VENDOR_MATCH_THRESHOLD: int = 88          # vendor similarity for a clean vendor-only match
+# Vendor similarity required to even CONSIDER an invoice a candidate when the
+# invoice number does NOT match. Kept high to avoid false matches like
+# "LinkedIn" vs "Uline" (~75%) stealing an unrelated invoice.
+VENDOR_CANDIDATE_THRESHOLD: int = 85
+# When the invoice NUMBER matches exactly, the document is already identified, so
+# the vendor name only needs to be *plausibly* the same entity (catches
+# "Dell Corp" vs "Dell Inc.", "Amazon Web Svcs" vs "Amazon Web Services, Inc.").
+VENDOR_CORROBORATION_THRESHOLD: int = 70
 MONEY_PRECISION: int = 2                  # money compared to the penny
 
 # Default reconciliation tolerances (callers/UI may override per run).
@@ -353,6 +360,13 @@ def _evaluate_matched_line(
     """
     Render the deterministic verdict for a ledger line with a matched candidate.
 
+    The invoice NUMBER is treated as the primary key. When it matches exactly,
+    the document is positively identified, so the vendor name only needs to be
+    *plausibly* the same entity (corroboration threshold) — this lets fuzzy
+    vendor spellings like "Dell Corp" vs "Dell Inc." verify when the invoice
+    number and amount both tie out. When the match was made on vendor similarity
+    alone (no invoice-number match), the stricter vendor threshold applies.
+
     Produces VERIFIED, VERIFIED_WITHIN_TOLERANCE, or EXCEPTION.
     """
     result = _base_row(ledger)
@@ -363,68 +377,108 @@ def _evaluate_matched_line(
     invoice_no_match = detail["invoice_no_match"]
     vendor_score = detail["vendor_score"]
     vendor_ok = vendor_score >= VENDOR_MATCH_THRESHOLD
+    vendor_plausible = vendor_score >= VENDOR_CORROBORATION_THRESHOLD
+
+    led_vendor = result["ledger_vendor"]
+    doc_vendor = invoice.get("vendor_name")
+    led_inv_no = result["ledger_invoice_no"]
+    doc_inv_no = invoice.get("invoice_number")
 
     # --- Deterministic amount evaluation -------------------------------------
     if led_amount is None or inv_amount is None:
         variance = led_amount if led_amount is not None else 0.0
-        result["variance"] = variance
         amount_exact = amount_within_tol = False
         allowed = 0.0
     else:
         variance = round(led_amount - inv_amount, MONEY_PRECISION)
         allowed = _tolerance_allowed(inv_amount, abs_tol, rel_tol)
-        result["variance"] = variance
         amount_exact = variance == 0.0
         amount_within_tol = abs(variance) <= allowed
+    result["variance"] = variance
 
-    info_ok = invoice_no_match and vendor_ok
-
-    # --- VERIFIED (exact, all three gates) -----------------------------------
-    if info_ok and amount_exact:
-        result["status"] = STATUS_VERIFIED
-        result["audit_notes"] = (
-            "VERIFIED: invoice number matches exactly, vendor matches "
-            f"(similarity {vendor_score}%), and the amount ties out to the penny "
-            f"(variance {variance:.2f})."
-        )
-        return result
-
-    # --- VERIFIED_WITHIN_TOLERANCE (info matches, amount inside the band) -----
-    if info_ok and amount_within_tol:
-        result["status"] = STATUS_VERIFIED_TOL
-        result["audit_notes"] = (
-            "VERIFIED WITHIN TOLERANCE: invoice number and vendor match; amount "
-            f"variance of {variance:.2f} is within the allowed tolerance of "
-            f"±{allowed:.2f} (abs ${abs_tol:.2f} / rel {rel_tol * 100:.3g}%). "
-            "Likely rounding, tax, or FX. Logged for auditor awareness."
-        )
-        return result
-
-    # --- EXCEPTION (anything else) -------------------------------------------
     reasons: list[str] = []
-    if led_amount is None or inv_amount is None:
-        if inv_amount is None:
-            reasons.append("the invoice has no readable total amount to compare")
+
+    if invoice_no_match:
+        # Invoice number identifies the document. Require only that the vendor is
+        # plausibly the same entity; flag a markedly different vendor (which would
+        # suggest a reused invoice number or a misposting).
+        if not vendor_plausible:
+            reasons.append(
+                f"invoice number matches but the vendor is markedly different "
+                f"(similarity {vendor_score}%; ledger '{led_vendor}' vs document "
+                f"'{doc_vendor}') — possible misposting or reused invoice number"
+            )
+        elif amount_exact:
+            result["status"] = STATUS_VERIFIED
+            vmsg = (
+                "vendor matches exactly"
+                if vendor_ok
+                else f"vendor matches via fuzzy/abbreviation (similarity {vendor_score}%)"
+            )
+            result["audit_notes"] = (
+                f"VERIFIED: invoice number matches exactly, {vmsg}, and the amount "
+                f"ties out to the penny (variance {variance:.2f})."
+            )
+            return result
+        elif amount_within_tol:
+            result["status"] = STATUS_VERIFIED_TOL
+            result["audit_notes"] = (
+                "VERIFIED WITHIN TOLERANCE: invoice number matches and vendor is "
+                f"consistent (similarity {vendor_score}%); amount variance of "
+                f"{variance:.2f} is within the allowed tolerance of ±{allowed:.2f} "
+                f"(abs ${abs_tol:.2f} / rel {rel_tol * 100:.3g}%). Likely rounding, "
+                "tax, or FX. Logged for auditor awareness."
+            )
+            return result
         else:
-            reasons.append("the ledger line has no readable amount to compare")
-    elif not amount_within_tol:
-        reasons.append(
-            f"amount variance of {variance:.2f} exceeds the allowed tolerance of "
-            f"±{allowed:.2f} (ledger {led_amount:.2f} vs invoice {inv_amount:.2f})"
-        )
+            reasons.append(
+                f"amount variance of {variance:.2f} exceeds the allowed tolerance "
+                f"of ±{allowed:.2f} (ledger {led_amount:.2f} vs invoice "
+                f"{inv_amount:.2f})"
+            )
+    else:
+        # Matched on vendor similarity only — no invoice-number corroboration, so
+        # apply the strict vendor threshold and flag any invoice-number conflict.
+        if led_inv_no and doc_inv_no:
+            reasons.append(
+                f"invoice number mismatch (ledger '{led_inv_no}' vs document "
+                f"'{doc_inv_no}')"
+            )
+        if not vendor_ok:
+            reasons.append(
+                f"vendor only a weak match (similarity {vendor_score}% < "
+                f"{VENDOR_MATCH_THRESHOLD}% threshold; ledger '{led_vendor}' vs "
+                f"document '{doc_vendor}')"
+            )
+        if led_amount is None or inv_amount is None:
+            reasons.append("an amount is missing and cannot be compared")
+        elif not amount_within_tol:
+            reasons.append(
+                f"amount variance of {variance:.2f} exceeds the allowed tolerance "
+                f"of ±{allowed:.2f} (ledger {led_amount:.2f} vs invoice "
+                f"{inv_amount:.2f})"
+            )
 
-    if not invoice_no_match:
-        reasons.append(
-            f"invoice number mismatch (ledger '{result['ledger_invoice_no']}' vs "
-            f"document '{invoice.get('invoice_number')}')"
-        )
-    if not vendor_ok:
-        reasons.append(
-            f"vendor only a weak match (similarity {vendor_score}% < "
-            f"{VENDOR_MATCH_THRESHOLD}% threshold; ledger '{result['ledger_vendor']}' "
-            f"vs document '{invoice.get('vendor_name')}')"
-        )
+        if not reasons:
+            # Strong vendor, amounts tie, and the ledger carried no invoice number
+            # to conflict with — accept it.
+            if amount_exact:
+                result["status"] = STATUS_VERIFIED
+                result["audit_notes"] = (
+                    f"VERIFIED: vendor matches (similarity {vendor_score}%) and the "
+                    f"amount ties out to the penny (variance {variance:.2f}). "
+                    "Matched without an invoice number."
+                )
+            else:
+                result["status"] = STATUS_VERIFIED_TOL
+                result["audit_notes"] = (
+                    f"VERIFIED WITHIN TOLERANCE: vendor matches (similarity "
+                    f"{vendor_score}%); amount variance of {variance:.2f} within "
+                    f"±{allowed:.2f}. Matched without an invoice number."
+                )
+            return result
 
+    # --- EXCEPTION (fell through) --------------------------------------------
     result["status"] = STATUS_EXCEPTION
     result["audit_notes"] = (
         "EXCEPTION: a candidate document was found but it does not fully tie out. "
@@ -433,30 +487,32 @@ def _evaluate_matched_line(
     return result
 
 
-def _duplicate_result(
-    ledger: dict, invoice: dict, detail: dict, first_row: Any
-) -> dict:
-    """Build a POTENTIAL_DUPLICATE_CLAIM row referencing the prior claimant."""
-    result = _base_row(ledger)
-    result["matching_invoice_file"] = _invoice_file_ref(invoice)
+def _duplicate_document_result(invoice: dict) -> dict:
+    """
+    Build a POTENTIAL_DUPLICATE_CLAIM row for an unmatched invoice whose number
+    is the SAME as an invoice already matched to the ledger.
 
-    led_amount = detail["led_amount"]
-    inv_amount = detail["inv_amount"]
-    variance = (
-        round(led_amount - inv_amount, MONEY_PRECISION)
-        if led_amount is not None and inv_amount is not None
-        else (led_amount if led_amount is not None else 0.0)
-    )
-    result["variance"] = variance
-    result["status"] = STATUS_DUPLICATE
-    result["audit_notes"] = (
-        "POTENTIAL DUPLICATE CLAIM: this ledger line matches invoice "
-        f"'{invoice.get('invoice_number')}' "
-        f"({_invoice_file_ref(invoice)}), which was ALREADY claimed by ledger "
-        f"row {first_row}. Possible duplicate booking/payment — requires auditor "
-        "investigation."
-    )
-    return result
+    This is a duplicate *document* (e.g. a re-scanned copy of an invoice that was
+    already recorded), not an unrecorded liability — so it must not be reported
+    as a completeness risk.
+    """
+    inv_amount = _to_money(invoice.get("total_amount"))
+    return {
+        "ledger_row_index": None,
+        "ledger_vendor": str(invoice.get("vendor_name") or ""),
+        "ledger_amount": inv_amount if inv_amount is not None else 0.0,
+        "ledger_invoice_no": str(invoice.get("invoice_number") or ""),
+        "status": STATUS_DUPLICATE,
+        "variance": 0.0,
+        "matching_invoice_file": _invoice_file_ref(invoice),
+        "audit_notes": (
+            "POTENTIAL DUPLICATE CLAIM: this invoice document carries the same "
+            f"invoice number ('{invoice.get('invoice_number')}') as an invoice "
+            "already matched to the ledger — it appears to be a duplicate copy of "
+            "a recorded invoice, not an unrecorded liability. Verify it is not a "
+            "second payment."
+        ),
+    }
 
 
 def _unrecorded_result(invoice: dict) -> dict:
@@ -551,8 +607,8 @@ def reconcile_ledger_with_invoices(
     processing_error_count = len(errored_invoices)
 
     results: list[dict] = []
-    claimed_by: dict[tuple, Any] = {}      # invoice identity -> first claiming row
-    matched_invoice_ids: set[int] = set()  # id() of every invoice claimed at all
+    matched_invoice_ids: set[int] = set()          # id() of every invoice claimed at all
+    claims_by_identity: dict[tuple, list[dict]] = {}  # invoice identity -> result rows
 
     # --- Pass 1: ledger -> invoice (existence) -------------------------------
     for ledger in ledger_data:
@@ -568,16 +624,11 @@ def reconcile_ledger_with_invoices(
             else:
                 matched_invoice_ids.add(id(best_invoice))
                 identity = _invoice_identity(best_invoice)
-                if identity in claimed_by:
-                    result = _duplicate_result(
-                        ledger, best_invoice, detail, claimed_by[identity]
-                    )
-                else:
-                    claimed_by[identity] = ledger.get("ledger_row_index")
-                    result = _evaluate_matched_line(
-                        ledger, best_invoice, detail,
-                        absolute_tolerance, relative_tolerance_pct,
-                    )
+                result = _evaluate_matched_line(
+                    ledger, best_invoice, detail,
+                    absolute_tolerance, relative_tolerance_pct,
+                )
+                claims_by_identity.setdefault(identity, []).append(result)
         except Exception as exc:  # noqa: BLE001 - never abort the whole batch
             logger.error(
                 "Failed to reconcile ledger row %r: %s",
@@ -593,9 +644,36 @@ def reconcile_ledger_with_invoices(
 
     ledger_result_count = len(results)
 
+    # --- Pass 1b: flag duplicate claims (an invoice claimed by >1 ledger line) -
+    # Both/all postings are flagged so the auditor reviews every one of them.
+    claimed_invoice_numbers: set[str] = set()
+    for identity, rows in claims_by_identity.items():
+        if identity[0] == "invno":
+            claimed_invoice_numbers.add(identity[1])
+        if len(rows) > 1:
+            claim_rows = sorted(
+                str(r["ledger_row_index"]) for r in rows if r["ledger_row_index"] is not None
+            )
+            inv_no = rows[0]["ledger_invoice_no"]
+            for r in rows:
+                r["status"] = STATUS_DUPLICATE
+                r["audit_notes"] = (
+                    f"POTENTIAL DUPLICATE CLAIM: invoice '{inv_no}' is referenced by "
+                    f"{len(rows)} ledger lines (rows {', '.join(claim_rows)}). "
+                    "Possible duplicate booking/payment — every posting requires "
+                    "auditor investigation."
+                )
+
     # --- Pass 2: invoice -> ledger (completeness / unrecorded liabilities) ---
     for invoice in valid_invoices:
-        if id(invoice) not in matched_invoice_ids:
+        if id(invoice) in matched_invoice_ids:
+            continue
+        inv_no = _norm_invoice_no(invoice.get("invoice_number"))
+        if inv_no and inv_no in claimed_invoice_numbers:
+            # Same invoice number as one already matched -> duplicate document,
+            # NOT an unrecorded liability.
+            results.append(_duplicate_document_result(invoice))
+        else:
             results.append(_unrecorded_result(invoice))
 
     # --- Pass 3: surface tooling failures distinctly -------------------------
@@ -652,7 +730,7 @@ if __name__ == "__main__":
     logging.getLogger("audit_agent.match_engine").setLevel(logging.INFO)
 
     mock_ledger = [
-        # 1) Perfect exact match (fuzzy vendor) -> VERIFIED
+        # 1) Exact match, fuzzy vendor ("Acme Corp" vs "Acme Corporation") -> VERIFIED
         {"ledger_row_index": 2, "ledger_vendor": "Acme Corp",
          "ledger_amount": 1250.00, "ledger_invoice_no": "INV-001"},
         # 2) $0.03 off, within tolerance -> VERIFIED_WITHIN_TOLERANCE
@@ -664,24 +742,58 @@ if __name__ == "__main__":
         # 4) $150 off, beyond tolerance -> EXCEPTION
         {"ledger_row_index": 5, "ledger_vendor": "Wayne Ent",
          "ledger_amount": 750.00, "ledger_invoice_no": "INV-003"},
-        # 5) Claims INV-001 again -> POTENTIAL_DUPLICATE_CLAIM (refers to row 2)
-        {"ledger_row_index": 6, "ledger_vendor": "Acme Corp",
-         "ledger_amount": 1250.00, "ledger_invoice_no": "INV-001"},
+        # 5) Exact invoice no. + amount but weak vendor spelling -> VERIFIED
+        #    (invoice number corroborates "Dell Corp" == "Dell Inc.")
+        {"ledger_row_index": 6, "ledger_vendor": "Dell Corp",
+         "ledger_amount": 4000.00, "ledger_invoice_no": "INV-9"},
+        # 6 & 7) Same invoice claimed twice -> BOTH POTENTIAL_DUPLICATE_CLAIM
+        {"ledger_row_index": 7, "ledger_vendor": "Beta LLC",
+         "ledger_amount": 100.00, "ledger_invoice_no": "INV-777"},
+        {"ledger_row_index": 8, "ledger_vendor": "Beta LLC",
+         "ledger_amount": 100.00, "ledger_invoice_no": "INV-777"},
+        # 8) Regression for the false-positive bug: a ledger line whose invoice
+        #    genuinely doesn't exist must NOT latch onto an unrelated invoice via
+        #    a weak (~75%) vendor near-miss -> MISSING_DOC.
+        {"ledger_row_index": 9, "ledger_vendor": "LinkedIn",
+         "ledger_amount": 8500.00, "ledger_invoice_no": "INV-LNK-60223"},
+        # 9) The "victim" invoice's real ledger line must stay VERIFIED (not be
+        #    demoted to a duplicate because something else claimed it first).
+        {"ledger_row_index": 10, "ledger_vendor": "Uline",
+         "ledger_amount": 4675.20, "ledger_invoice_no": "INV-UL-66902"},
+        # 10) Penny-exact match from a float-noisy amount -> VERIFIED, never
+        #     VERIFIED_WITHIN_TOLERANCE (regression for float rounding).
+        {"ledger_row_index": 11, "ledger_vendor": "Comcast Business",
+         "ledger_amount": 1240.6600000000001, "ledger_invoice_no": "INV-CMB-1"},
     ]
 
     mock_invoices = [
         {"vendor_name": "Acme Corporation", "invoice_number": "INV-001",
-         "date": "2026-01-15", "total_amount": 1250.00, "source_file": "acme_001.pdf"},
+         "total_amount": 1250.00, "source_file": "acme_001.pdf"},
         {"vendor_name": "Globex LLC", "invoice_number": "INV-002",
-         "date": "2026-01-16", "total_amount": 500.00, "source_file": "globex_002.pdf"},
+         "total_amount": 500.00, "source_file": "globex_002.pdf"},
         {"vendor_name": "Wayne Enterprises", "invoice_number": "INV-003",
-         "date": "2026-01-17", "total_amount": 900.00, "source_file": "wayne_003.pdf"},
+         "total_amount": 900.00, "source_file": "wayne_003.pdf"},
+        {"vendor_name": "Dell Inc.", "invoice_number": "INV-9",
+         "total_amount": 4000.00, "source_file": "dell_9.pdf"},
+        {"vendor_name": "Beta LLC", "invoice_number": "INV-777",
+         "total_amount": 100.00, "source_file": "beta_777.pdf"},
         # Never matched by any ledger line -> UNRECORDED_INVOICE
-        {"vendor_name": "Umbrella Inc", "invoice_number": "INV-777",
-         "date": "2026-01-20", "total_amount": 9999.99, "source_file": "umbrella_777.pdf"},
+        {"vendor_name": "Umbrella Inc", "invoice_number": "INV-888",
+         "total_amount": 9999.99, "source_file": "umbrella_888.pdf"},
+        # Same invoice number as a recorded invoice -> duplicate DOCUMENT, not
+        # an unrecorded liability -> POTENTIAL_DUPLICATE_CLAIM
+        {"vendor_name": "Beta LLC", "invoice_number": "INV-777",
+         "total_amount": 100.00, "source_file": "beta_777_SCAN.png"},
+        # The unrelated invoice the "LinkedIn" line must NOT steal; matches its
+        # own real ledger line (row 10) instead.
+        {"vendor_name": "Uline", "invoice_number": "INV-UL-66902",
+         "total_amount": 4675.20, "source_file": "uline_66902.pdf"},
+        # Penny-exact partner for the float-rounding row (row 11).
+        {"vendor_name": "Comcast Business", "invoice_number": "INV-CMB-1",
+         "total_amount": 1240.66, "source_file": "comcast_1.pdf"},
         # Flagged by OCR as unreadable -> PROCESSING_ERROR (NOT missing doc)
-        {"vendor_name": None, "invoice_number": None, "date": None,
-         "total_amount": None, "source_file": "blurry_scan.pdf",
+        {"vendor_name": None, "invoice_number": None, "total_amount": None,
+         "source_file": "blurry_scan.pdf",
          "processing_error": True, "error_detail": "Groq API rate limit (HTTP 429)"},
     ]
 
@@ -691,12 +803,13 @@ if __name__ == "__main__":
     print(json.dumps(report, indent=2))
 
     s = report["summary"]
-    assert s["total_ledger_records"] == 5
-    assert s["verified_count"] == 1, "one exact VERIFIED"
+    assert s["total_ledger_records"] == 10
+    assert s["verified_count"] == 4, "Acme, Dell(fuzzy), Uline, Comcast(penny-exact)"
     assert s["verified_within_tolerance_count"] == 1, "one VERIFIED_WITHIN_TOLERANCE"
     assert s["exception_count"] == 1, "one EXCEPTION"
-    assert s["missing_doc_count"] == 1, "one MISSING_DOC"
-    assert s["potential_duplicate_count"] == 1, "one POTENTIAL_DUPLICATE_CLAIM"
+    assert s["missing_doc_count"] == 2, "Initech + LinkedIn (no false match)"
+    # Two ledger duplicate claims + one duplicate document = 3
+    assert s["potential_duplicate_count"] == 3, "two ledger dups + one dup document"
     assert s["unrecorded_invoice_count"] == 1, "one UNRECORDED_INVOICE"
     assert s["processing_error_count"] == 1, "one PROCESSING_ERROR"
 
@@ -705,16 +818,30 @@ if __name__ == "__main__":
     assert by_row[3]["status"] == "VERIFIED_WITHIN_TOLERANCE" and by_row[3]["variance"] == 0.03
     assert by_row[4]["status"] == "MISSING_DOC"
     assert by_row[5]["status"] == "EXCEPTION" and by_row[5]["variance"] == -150.0
-    assert by_row[6]["status"] == "POTENTIAL_DUPLICATE_CLAIM"
-    assert "row 2" in by_row[6]["audit_notes"], "duplicate must cite the first claimant"
+    # Fuzzy vendor verified purely because invoice no. + amount corroborate.
+    assert by_row[6]["status"] == "VERIFIED", "exact inv#+amount must verify fuzzy vendor"
+    # Both postings of INV-777 flagged.
+    assert by_row[7]["status"] == "POTENTIAL_DUPLICATE_CLAIM"
+    assert by_row[8]["status"] == "POTENTIAL_DUPLICATE_CLAIM"
+    assert "rows 7, 8" in by_row[7]["audit_notes"], "duplicate must cite all claimants"
+    # Bug #1 regression: the no-invoice line must NOT steal the Uline document...
+    assert by_row[9]["status"] == "MISSING_DOC", "weak vendor near-miss must not attach"
+    # ...and Uline's real line must stay VERIFIED (not demoted to a duplicate).
+    assert by_row[10]["status"] == "VERIFIED", "victim invoice line must stay verified"
+    # Bug #4 regression: penny-exact from float noise is VERIFIED, not within-tol.
+    assert by_row[11]["status"] == "VERIFIED" and by_row[11]["variance"] == 0.0
 
-    # The errored invoice must NOT have been treated as a missing document or
-    # an unrecorded liability — it lives in its own PROCESSING_ERROR bucket.
+    # The duplicate scanned copy is a duplicate DOCUMENT, not unrecorded.
+    dup_docs = [r for r in report["results"]
+                if r["status"] == "POTENTIAL_DUPLICATE_CLAIM"
+                and r["ledger_row_index"] is None]
+    assert dup_docs and "beta_777_SCAN.png" in (dup_docs[0]["matching_invoice_file"] or "")
+
+    # The errored invoice lives in its own PROCESSING_ERROR bucket.
     err_rows = [r for r in report["results"] if r["status"] == "PROCESSING_ERROR"]
     assert err_rows and "blurry_scan.pdf" in (err_rows[0]["matching_invoice_file"] or "")
     assert "AI EXTRACTION FAILURE" in err_rows[0]["audit_notes"]
 
-    # Tolerance settings echoed back for the workpaper / reproducibility.
     assert s["tolerance_absolute"] == 0.05 and s["tolerance_relative_pct"] == 0.005
 
     print("\n[self-test] All assertions passed. Every status path verified. [OK]")
